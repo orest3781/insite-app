@@ -1,0 +1,39 @@
+    def _pulse_progress_bar(self):
+        """Create a subtle animation effect on the progress bar during processing."""
+        if not self.orchestrator or self.orchestrator.state not in [ProcessingState.RUNNING]:
+            self._progress_pulse_timer.stop()
+            return
+        
+        # Create a subtle ripple effect in the progress bar
+        self._progress_pulse_effect = (self._progress_pulse_effect + 1) % 4
+        
+        # Change the gradient colors slightly based on the pulse effect
+        if self._progress_pulse_effect == 0:
+            chunk_style = """
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4CAF50, stop:0.5 #66BB6A, stop:1 #81C784);
+            """
+        elif self._progress_pulse_effect == 1:
+            chunk_style = """
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #66BB6A, stop:0.5 #81C784, stop:1 #4CAF50);
+            """
+        elif self._progress_pulse_effect == 2:
+            chunk_style = """
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #81C784, stop:0.5 #4CAF50, stop:1 #66BB6A);
+            """
+        else:
+            chunk_style = """
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4CAF50, stop:0.3 #81C784, stop:0.7 #66BB6A, stop:1 #4CAF50);
+            """
+        
+        # Update progress bar style with the new gradient
+        current_style = self.proc_progress.styleSheet()
+        style_parts = current_style.split("QProgressBar::chunk {")
+        if len(style_parts) == 2:
+            style_prefix = style_parts[0] + "QProgressBar::chunk {"
+            style_suffix = style_parts[1].split("}", 1)[1]
+            new_style = style_prefix + chunk_style + "border-radius: 6px;\nmargin: 1px;\n}" + style_suffix
+            self.proc_progress.setStyleSheet(new_style)

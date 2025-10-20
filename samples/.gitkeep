@@ -1,0 +1,11 @@
+# Sample Files
+
+This directory is for sample documents to test the application.
+
+Add your sample PDFs and images here for testing:
+- invoice.pdf
+- receipt.jpg
+- document.png
+- etc.
+
+These files are excluded from version control.

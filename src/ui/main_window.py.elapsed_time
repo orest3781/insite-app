@@ -1,0 +1,23 @@
+    def _update_elapsed_time(self):
+        """Update the elapsed time label based on processing start time."""
+        if not self._processing_start_time or not self.orchestrator or self.orchestrator.state not in [ProcessingState.RUNNING]:
+            if hasattr(self, '_elapsed_timer') and self._elapsed_timer.isActive():
+                self._elapsed_timer.stop()
+            return
+        
+        # Calculate elapsed time
+        elapsed_seconds = (datetime.now() - self._processing_start_time).total_seconds()
+        
+        # Format elapsed time display
+        if elapsed_seconds < 60:
+            elapsed_text = f"⏳ Elapsed: {int(elapsed_seconds)}s"
+        elif elapsed_seconds < 3600:
+            minutes = int(elapsed_seconds / 60)
+            seconds = int(elapsed_seconds % 60)
+            elapsed_text = f"⏳ Elapsed: {minutes}m {seconds}s"
+        else:
+            hours = int(elapsed_seconds / 3600)
+            minutes = int((elapsed_seconds % 3600) / 60)
+            elapsed_text = f"⏳ Elapsed: {hours}h {minutes}m"
+        
+        self.proc_elapsed_label.setText(elapsed_text)

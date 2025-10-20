@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Application Data (portable root contents)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+logs/*.log
+logs/*.txt
+exports/*
+!exports/.gitkeep
+models/ocr/lang/*
+!models/ocr/lang/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Temporary files
+*.tmp
+*.bak
+*.swp

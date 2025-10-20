@@ -1,0 +1,98 @@
+    def _add_file_to_results(self, file_id):
+        """
+        Add a single file to the results table without refreshing the entire table.
+        Used for automatic updates when a file is processed.
+        
+        Args:
+            file_id: ID of the file to add to results table
+        """
+        from PySide6.QtGui import QColor
+        
+        try:
+            # Get file details from database
+            file_details = self.db.get_file_details(file_id)
+            
+            if not file_details:
+                logger.warning(f"File details not found for ID: {file_id}")
+                return
+                
+            # Insert at the beginning of the table (most recent first)
+            row = 0
+            self.results_table.insertRow(row)
+            
+            # File name
+            file_path = Path(file_details['file_path'])
+            file_item = QTableWidgetItem(file_path.name)
+            # Store file_id for later retrieval
+            file_item.setData(Qt.ItemDataRole.UserRole, file_details['file_id'])
+            self.results_table.setItem(row, 0, file_item)
+            
+            # File type
+            file_type = file_details.get('file_type', '').upper() or 'UNKNOWN'
+            self.results_table.setItem(row, 1, QTableWidgetItem(file_type))
+            
+            # Tags (truncated if too long)
+            tags = file_details.get('tags', '') or '-'
+            if len(tags) > 50:
+                tags = tags[:47] + '...'
+            self.results_table.setItem(row, 2, QTableWidgetItem(tags))
+            
+            # Description (truncated)
+            description = file_details.get('description_text', '') or '-'
+            if len(description) > 100:
+                description = description[:97] + '...'
+            self.results_table.setItem(row, 3, QTableWidgetItem(description))
+            
+            # Confidence (average of tag and description confidence)
+            tag_conf = file_details.get('avg_tag_confidence', 0) or 0
+            desc_conf = file_details.get('description_confidence', 0) or 0
+            avg_conf = (tag_conf + desc_conf) / 2 if (tag_conf or desc_conf) else 0
+            
+            conf_text = f"{avg_conf:.1%}" if avg_conf > 0 else "-"
+            conf_item = QTableWidgetItem(conf_text)
+            
+            # Color code confidence
+            if avg_conf >= 0.8:
+                conf_item.setForeground(Qt.GlobalColor.green)
+            elif avg_conf >= 0.5:
+                conf_item.setForeground(Qt.GlobalColor.yellow)
+            else:
+                conf_item.setForeground(Qt.GlobalColor.red)
+            
+            self.results_table.setItem(row, 4, conf_item)
+            
+            # Analyzed date
+            analyzed_at = file_details.get('analyzed_at', '')
+            if analyzed_at:
+                try:
+                    dt = datetime.fromisoformat(analyzed_at)
+                    date_str = dt.strftime("%Y-%m-%d %H:%M")
+                except:
+                    date_str = analyzed_at
+            else:
+                date_str = '-'
+            
+            self.results_table.setItem(row, 5, QTableWidgetItem(date_str))
+            
+            # Highlight the newly added row for better visibility
+            for col in range(self.results_table.columnCount()):
+                item = self.results_table.item(row, col)
+                if item:
+                    # Set a light green background for the new item
+                    item.setBackground(QColor(240, 255, 240))  # Light green
+            
+            # Update count
+            current_count = int(self.results_count_label.text().split(': ')[1])
+            self.results_count_label.setText(f"Total files: {current_count + 1}")
+            
+            # Switch to results tab if not already on it
+            if self.main_tab_widget.currentWidget() != self.results_tab:
+                # Only show notification, don't force tab switch
+                self._show_notification(f"Added result: {file_path.name}", "success", 3000)
+            
+            logger.info(f"Added file to results: {file_path.name}")
+            
+        except Exception as e:
+            logger.error(f"Error adding file to results: {e}")
+            # Fallback to full refresh if single-file update fails
+            self._refresh_results()

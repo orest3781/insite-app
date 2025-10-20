@@ -1,0 +1,68 @@
+{
+  "paths": {
+    "data_dir": "data",
+    "database_file": "data/previewless.db",
+    "logs_dir": "logs",
+    "models_dir": "models",
+    "exports_dir": "exports",
+    "tesseract_cmd": "S:/Tesseract-OCR/tesseract.exe"
+  },
+  "ocr": {
+    "default_mode": "fast",
+    "languages": [
+      "eng"
+    ],
+    "psm": "auto",
+    "oem": "auto",
+    "retries": 1,
+    "preproc_profile": "light"
+  },
+  "ollama": {
+    "host": "http://localhost:11434",
+    "default_model": "llama3.2",
+    "default_model_vision": null,
+    "default_model_ocr": null,
+    "default_model_text": null,
+    "temperature": 0.4,
+    "max_tokens": 270,
+    "top_p": 0.7,
+    "timeout_s": 30,
+    "auto_pull_models": true
+  },
+  "cloud": {
+    "enabled_globally": false,
+    "provider": null,
+    "api_key": null
+  },
+  "batch": {
+    "concurrency": 1,
+    "max_retry_count": 1,
+    "stop_on_error": true
+  },
+  "search": {
+    "fts_descriptions_enabled": true,
+    "fts_text_enabled": true,
+    "fts_tokenizer": "unicode61",
+    "max_query_time_ms": 3000
+  },
+  "ui": {
+    "theme": "dark",
+    "font_scale": 1.0,
+    "high_contrast": false,
+    "table_page_size": 1000,
+    "show_previews": true,
+    "preview_size": 128,
+    "confirm_delete": true,
+    "auto_save": true,
+    "restore_last_session": false
+  },
+  "diagnostics": {
+    "debug_mode": false,
+    "verbose_logging": false,
+    "log_rotation_files": 10,
+    "log_rotation_size_mb": 5
+  },
+  "watched_folders": [
+    "S:\\.test-images\\TestMix\\images\\opencv_samples"
+  ]
+}

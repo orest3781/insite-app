@@ -1,0 +1,81 @@
+    def _add_file_to_results(self, result):
+        """
+        Add a single processed file to the results table without refreshing everything.
+        
+        Args:
+            result: ProcessingResult object from the orchestrator
+        """
+        try:
+            # Don't add if there was an error or the file wasn't processed successfully
+            if result.error_code or result.status != "completed":
+                logger.debug(f"Skipping results tab update for file with errors: {result.file_path}")
+                return
+                
+            # Check if we're on the results tab - only perform visible updates if so
+            is_results_tab_active = self.tabs.currentIndex() == self.tabs.indexOf(self.results_tab)
+            
+            # Add new row at the top of the table
+            row = 0
+            self.results_table.insertRow(row)
+            
+            # File name (just the name, not full path)
+            file_path = Path(result.file_path)
+            self.results_table.setItem(row, 0, QTableWidgetItem(file_path.name))
+            
+            # File type
+            file_type = result.file_type.upper() if result.file_type else 'UNKNOWN'
+            self.results_table.setItem(row, 1, QTableWidgetItem(file_type))
+            
+            # Tags (truncated if too long)
+            tags_text = ', '.join(tag.get('label', '') for tag in result.tags) if result.tags else '-'
+            if len(tags_text) > 50:
+                tags_text = tags_text[:47] + '...'
+            self.results_table.setItem(row, 2, QTableWidgetItem(tags_text))
+            
+            # Date
+            date_text = datetime.now().strftime('%Y-%m-%d %H:%M')
+            self.results_table.setItem(row, 3, QTableWidgetItem(date_text))
+            
+            # Add view button
+            view_btn = QPushButton("👁️ View")
+            view_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3498db;
+                    color: white;
+                    border: none;
+                    border-radius: 3px;
+                    padding: 4px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #2980b9;
+                }
+            """)
+            view_btn.clicked.connect(lambda: self._view_result(result.file_path))
+            self.results_table.setCellWidget(row, 4, view_btn)
+            
+            # Highlight the new row if results tab is active
+            if is_results_tab_active:
+                # Highlight the row briefly to indicate it's new
+                for col in range(self.results_table.columnCount()):
+                    item = self.results_table.item(row, col)
+                    if item:  # Skip cell widgets
+                        item.setBackground(QColor("#e6ffe6"))  # Light green background
+                
+                # After 3 seconds, remove the highlight
+                QTimer.singleShot(3000, lambda: self._clear_row_highlight(row))
+            
+            # Update the results count in the tab title
+            count = self.results_table.rowCount()
+            self.tabs.setTabText(self.tabs.indexOf(self.results_tab), f"📊 Results ({count})")
+            
+            logger.debug(f"Added {file_path.name} to results table automatically")
+        except Exception as e:
+            logger.error(f"Error adding file to results tab: {e}")
+    
+    def _clear_row_highlight(self, row):
+        """Clear highlighting from a row after the animation period."""
+        if row < self.results_table.rowCount():  # Make sure row still exists
+            for col in range(self.results_table.columnCount()):
+                item = self.results_table.item(row, col)
+                if item:
+                    item.setBackground(QColor("transparent"))
