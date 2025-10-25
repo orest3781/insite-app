@@ -17,6 +17,10 @@ from PySide6.QtCore import QObject, Signal
 logger = logging.getLogger(__name__)
 
 
+# Default priority value (higher numbers process first)
+DEFAULT_QUEUE_PRIORITY = 5
+
+
 class QueueItemStatus(Enum):
     """Status of items in the queue."""
     PENDING = "pending"
@@ -33,7 +37,7 @@ class QueueItem:
     file_hash: Optional[str] = None
     file_type: Optional[str] = None
     status: QueueItemStatus = QueueItemStatus.PENDING
-    priority: int = 0
+    priority: int = DEFAULT_QUEUE_PRIORITY
     added_at: datetime = field(default_factory=datetime.now)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -86,7 +90,7 @@ class QueueManager(QObject):
         
         logger.info("QueueManager initialized")
     
-    def add_item(self, file_path: str, priority: int = 0) -> bool:
+    def add_item(self, file_path: str, priority: Optional[int] = None) -> bool:
         """
         Add a file to the queue.
         
@@ -98,6 +102,9 @@ class QueueManager(QObject):
             True if added successfully, False if already in queue or unsupported file type
         """
         abs_path = str(Path(file_path).resolve())
+
+        if priority is None:
+            priority = DEFAULT_QUEUE_PRIORITY
         
         if abs_path in self._queue_map:
             logger.debug(f"File already in queue: {abs_path}")
@@ -137,7 +144,7 @@ class QueueManager(QObject):
         
         return True
     
-    def add_batch(self, file_paths: List[str], priority: int = 0) -> int:
+    def add_batch(self, file_paths: List[str], priority: Optional[int] = None) -> int:
         """
         Add multiple files to the queue.
         
@@ -148,6 +155,9 @@ class QueueManager(QObject):
         Returns:
             Number of items successfully added
         """
+        if priority is None:
+            priority = DEFAULT_QUEUE_PRIORITY
+
         added_count = 0
         for file_path in file_paths:
             if self.add_item(file_path, priority):
@@ -155,6 +165,76 @@ class QueueManager(QObject):
         
         logger.info(f"Batch add: {added_count}/{len(file_paths)} items added")
         return added_count
+
+    def set_item_priority(self, file_path: str, priority: int) -> bool:
+        """Set priority for a queue item and reinsert it based on priority."""
+        abs_path = str(Path(file_path).resolve())
+
+        if abs_path not in self._queue_map:
+            logger.debug(f"Cannot set priority for unknown item: {abs_path}")
+            return False
+
+        item = self._queue_map[abs_path]
+
+        if item.priority == priority:
+            logger.debug(f"Priority unchanged for {abs_path} (value already {priority})")
+            return True
+
+        if priority < 0:
+            priority = 0
+
+        self.queue.remove(item)
+        item.priority = priority
+
+        insert_pos = len(self.queue)
+        for i, existing_item in enumerate(self.queue):
+            if existing_item.priority < priority:
+                insert_pos = i
+                break
+
+        self.queue.insert(insert_pos, item)
+
+        logger.info(f"Updated queue priority: {abs_path} -> {priority}")
+        self.item_updated.emit(item)
+        self.queue_reordered.emit([queue_item.file_path for queue_item in self.queue])
+        self._update_progress()
+        return True
+
+    def set_batch_priority(self, file_paths: List[str], priority: int) -> int:
+        """Set priority for multiple queue items at once."""
+        if priority < 0:
+            priority = 0
+
+        unique_paths = []
+        seen = set()
+        for file_path in file_paths:
+            abs_path = str(Path(file_path).resolve())
+            if abs_path not in seen:
+                seen.add(abs_path)
+                unique_paths.append(abs_path)
+
+        items_to_update = [self._queue_map[path] for path in unique_paths if path in self._queue_map]
+
+        if not items_to_update:
+            return 0
+
+        for item in items_to_update:
+            self.queue.remove(item)
+
+        for item in items_to_update:
+            item.priority = priority
+            insert_pos = len(self.queue)
+            for i, existing_item in enumerate(self.queue):
+                if existing_item.priority < priority:
+                    insert_pos = i
+                    break
+            self.queue.insert(insert_pos, item)
+            self.item_updated.emit(item)
+
+        self.queue_reordered.emit([queue_item.file_path for queue_item in self.queue])
+        logger.info(f"Batch priority update applied to {len(items_to_update)} item(s) -> {priority}")
+        self._update_progress()
+        return len(items_to_update)
     
     def remove_item(self, file_path: str) -> bool:
         """

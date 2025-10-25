@@ -2,20 +2,23 @@
 Main application window for Previewless Insight Viewer.
 """
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
     QLabel, QStatusBar, QMenuBar, QMenu, QPushButton,
     QListWidget, QTableWidget, QTableWidgetItem, QProgressBar,
-    QFileDialog, QGroupBox, QHeaderView, QLineEdit, QMessageBox
+    QFileDialog, QGroupBox, QHeaderView, QLineEdit, QMessageBox,
+    QComboBox, QDialog, QDialogButtonBox, QRadioButton, QButtonGroup,
+    QAbstractItemView
 )
-from PySide6.QtCore import Qt, QSize, QTimer, QThread, QMetaObject, Q_ARG, Signal
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtCore import Qt, QSize, QTimer, QThread, QMetaObject, Q_ARG, Signal, QUrl
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QDesktopServices
 
 from src.core.config import ConfigManager
 from src.models.database import Database
 from src.services.file_watcher import FileWatcherService
-from src.services.queue_manager import QueueManager, QueueItemStatus
+from src.services.queue_manager import QueueManager, QueueItemStatus, DEFAULT_QUEUE_PRIORITY
 from src.services.ocr_adapter import OCRAdapter
 from src.services.llm_adapter import OllamaAdapter
 from src.services.processing_orchestrator import ProcessingOrchestrator, ProcessingState
@@ -29,14 +32,175 @@ from src.ui.menu_handlers import (
     _show_db_maintenance, _show_help_center, _show_quickstart,
     _check_for_updates, _show_about, _view_processed_files
 )
+from src.ui.widgets import ProcessingControlsWidget, ProcessingControlsIntegration, ProcessingState
 
 
 logger = get_logger("ui.main_window")
 
 
+class PrioritySelectionDialog(QDialog):
+    """Dialog prompting the user to choose a priority level."""
+
+    def __init__(self, palette: dict, options: list, default_value: int, parent=None):
+        super().__init__(parent)
+        self._palette = palette
+        self._options = options
+        self._default_value = default_value
+        self.setModal(True)
+        self.setWindowTitle("Choose Priority")
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+        self.header_label = QLabel("How should these files be prioritized?")
+        self.header_label.setWordWrap(True)
+        layout.addWidget(self.header_label)
+
+        self.button_group = QButtonGroup(self)
+
+        for index, option in enumerate(self._options):
+            icon = option.get("icon", "")
+            label = option["label"]
+            description = option.get("description", "")
+            value = option["value"]
+
+            radio = QRadioButton(f"{icon} {label}".strip())
+            radio.setProperty("priorityValue", value)
+            if value == self._default_value:
+                radio.setChecked(True)
+            elif index == 0 and self.button_group.checkedButton() is None:
+                radio.setChecked(True)
+
+            self.button_group.addButton(radio)
+            layout.addWidget(radio)
+
+            if description:
+                description_label = QLabel(description)
+                description_label.setObjectName("priorityDescription")
+                description_label.setWordWrap(True)
+                layout.addWidget(description_label)
+
+        layout.addSpacing(8)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Add to Queue")
+        button_box.button(QDialogButtonBox.Cancel).setText("Cancel")
+        layout.addWidget(button_box)
+
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        self._apply_stylesheet()
+
+    def selected_priority(self) -> int:
+        """Return the selected priority value."""
+        for button in self.button_group.buttons():
+            if button.isChecked():
+                return button.property("priorityValue")
+        return self._default_value
+
+    def set_message(self, message: str) -> None:
+        """Update the dialog header message."""
+        self.header_label.setText(message)
+
+    def _apply_stylesheet(self):
+        """Apply dialog styling based on the shared palette."""
+        palette = self._palette
+        self.setStyleSheet(
+            f"""
+            QDialog {{
+                background-color: {palette['surface']};
+                color: {palette['text_primary']};
+            }}
+            QLabel {{
+                color: {palette['text_secondary']};
+            }}
+            QLabel#priorityDescription {{
+                font-size: 11px;
+                margin-left: 24px;
+            }}
+            QRadioButton {{
+                color: {palette['text_primary']};
+                spacing: 8px;
+                padding: 6px 4px;
+            }}
+            QRadioButton:hover {{
+                background-color: {palette['hover']};
+                border-radius: 6px;
+            }}
+            QRadioButton:focus-visible {{
+                outline: 2px solid {palette['focus']};
+                outline-offset: 2px;
+            }}
+            QDialogButtonBox QPushButton {{
+                background-color: {palette['accent']};
+                color: {palette['text_primary']};
+                border: 1px solid {palette['accent']};
+                border-radius: 6px;
+                padding: 6px 16px;
+            }}
+            QDialogButtonBox QPushButton:hover {{
+                background-color: {palette['selected_hover']};
+            }}
+            QDialogButtonBox QPushButton:pressed {{
+                background-color: {palette['pressed']};
+            }}
+            QDialogButtonBox QPushButton:focus-visible {{
+                outline: 2px solid {palette['focus']};
+                outline-offset: 2px;
+            }}
+            QDialogButtonBox QPushButton:disabled {{
+                background-color: {palette['surface_alt']};
+                border-color: {palette['dividers']};
+                color: {palette['text_disabled']};
+            }}
+            """
+        )
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
     
+    APP_PALETTE = {
+        "canvas": "#0B1220",
+        "surface": "#0F1B2D",
+        "surface_alt": "#12233B",
+        "hover": "#16304B",
+        "pressed": "#183454",
+        "selected": "#183C73",
+        "selected_hover": "#1B447F",
+        "accent": "#2563EB",
+        "focus": "#60A5FA",
+        "text_primary": "#E6F0FF",
+        "text_secondary": "#ADC2E8",
+        "text_disabled": "#7A8AAA",
+        "dividers": "#24314A",
+        "alert_success": "#22C55E",
+        "alert_warning": "#F97316",
+        "alert_error": "#EF4444",
+    }
+
+    # Backwards compatibility while migrating existing queue styling helpers
+    QUEUE_PALETTE = APP_PALETTE
+
+    STATUS_COLORS = {
+        "info": APP_PALETTE["accent"],
+        "success": APP_PALETTE["alert_success"],
+        "warning": APP_PALETTE["alert_warning"],
+        "error": APP_PALETTE["alert_error"],
+    }
+
+    QUEUE_PRIORITY_LEVELS = [
+        {"label": "High Priority", "value": 10, "icon": "🔥", "description": "Process these files first."},
+        {"label": "Normal Priority", "value": DEFAULT_QUEUE_PRIORITY, "icon": "●", "description": "Balanced throughput for most batches."},
+        {"label": "Low Priority", "value": 0, "icon": "⏳", "description": "Handle after higher priority work."},
+    ]
+
+    PRIORITY_LABELS = {
+        10: ("🔥 High", "Process next"),
+        DEFAULT_QUEUE_PRIORITY: ("● Normal", "Standard flow"),
+        0: ("⏳ Low", "Background"),
+    }
+
     # Signals to control processing on worker thread
     start_processing_signal = Signal()
     pause_processing_signal = Signal()
@@ -83,6 +247,7 @@ class MainWindow(QMainWindow):
         self._glow_direction = 1
         self._glow_timer = QTimer()
         self._glow_timer.timeout.connect(self._animate_queue_glow)
+        self._base_tab_bar_style = ""
         
         # AI model status
         self._ai_status_ok = False
@@ -109,23 +274,33 @@ class MainWindow(QMainWindow):
         
         # Worker thread for processing
         self._processing_thread = None
-        
+
+        # Queue priority controls
+        self.priority_combo: Optional[QComboBox] = None
+        self.priority_apply_btn: Optional[QPushButton] = None
+
+        # Processing controls integration
+        self.processing_controls_integration: Optional[ProcessingControlsIntegration] = None
+        self.new_processing_controls: Optional[ProcessingControlsWidget] = None
+        self._using_new_controls: bool = False
+        self._last_progress_update: float = 0  # Throttle progress updates
+
         # Initialize services
         self._init_services()
-        
+
         # Window properties
         self.setWindowTitle("Previewless Insight Viewer")
         self.setMinimumSize(QSize(1200, 800))
-        
+
         # Initialize UI
         self._init_ui()
-        
+
         # Connect signals
         self._connect_signals()
-        
+
         # Start file watcher
         self.file_watcher.start_watching()
-        
+
         logger.info("Main window initialized")
     
     def _init_services(self):
@@ -187,6 +362,7 @@ class MainWindow(QMainWindow):
         
         # Create tab widget
         self.tabs = QTabWidget()
+        self._apply_tab_widget_theme()
         main_layout.addWidget(self.tabs)
         
         # Add tabs (removed Processing tab - now in top bar)
@@ -198,6 +374,9 @@ class MainWindow(QMainWindow):
         
         # Create status bar
         self._create_status_bar()
+
+        # Apply overarching styling once components are in place
+        self._apply_global_theme()
         
         # Auto-refresh timer to prevent UI lockups
         self._refresh_timer = QTimer()
@@ -206,251 +385,283 @@ class MainWindow(QMainWindow):
     
     def _create_processing_status_bar(self) -> None:
         """Create prominent processing status bar at top of window."""
+        colors = self.APP_PALETTE
         self.processing_status_bar = QWidget()
-        self.processing_status_bar.setStyleSheet("""
-            QWidget {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1e3c72, stop:1 #2a5298);
-                border-radius: 8px;
-                border: 2px solid #2a5298;
-                padding: 8px;
-            }
-        """)
+        self.processing_status_bar.setObjectName("processingStatusBar")
         self.processing_status_bar.setMinimumHeight(120)
-        
+
         bar_layout = QVBoxLayout(self.processing_status_bar)
-        bar_layout.setSpacing(8)
-        
+        bar_layout.setSpacing(12)
+        bar_layout.setContentsMargins(16, 16, 16, 16)
+
         # Top row: Status and controls
         top_row = QHBoxLayout()
-        
-        # Status indicator (large and prominent)
+
         status_container = QVBoxLayout()
+        status_container.setSpacing(4)
         self.proc_status_label = QLabel("⚙️ IDLE")
-        self.proc_status_label.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 18pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_status_label.setObjectName("processingStatusTitle")
         status_container.addWidget(self.proc_status_label)
-        
+
         self.proc_current_file_label = QLabel("No file processing")
-        self.proc_current_file_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.9);
-                font-size: 10pt;
-                background: transparent;
-            }
-        """)
+        self.proc_current_file_label.setObjectName("processingStatusSubtitle")
         status_container.addWidget(self.proc_current_file_label)
-        
+
         top_row.addLayout(status_container, 1)
-        
-        # Control buttons (compact)
-        controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(4)
-        
-        self.proc_start_btn = QPushButton("▶ Start")
-        self.proc_start_btn.clicked.connect(self._start_processing)
-        self.proc_start_btn.setMinimumHeight(35)
-        self.proc_start_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #45a049; }
-            QPushButton:disabled { background-color: #cccccc; }
-        """)
-        controls_layout.addWidget(self.proc_start_btn)
-        
-        self.proc_pause_btn = QPushButton("⏸ Pause")
-        self.proc_pause_btn.clicked.connect(self._pause_processing)
-        self.proc_pause_btn.setEnabled(False)
-        self.proc_pause_btn.setMinimumHeight(35)
-        self.proc_pause_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #e68900; }
-            QPushButton:disabled { background-color: #cccccc; }
-        """)
-        controls_layout.addWidget(self.proc_pause_btn)
-        
-        self.proc_stop_btn = QPushButton("⏹ Stop")
-        self.proc_stop_btn.clicked.connect(self._stop_processing)
-        self.proc_stop_btn.setEnabled(False)
-        self.proc_stop_btn.setMinimumHeight(35)
-        self.proc_stop_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #da190b; }
-            QPushButton:disabled { background-color: #cccccc; }
-        """)
-        controls_layout.addWidget(self.proc_stop_btn)
-        
-        self.proc_retry_btn = QPushButton("🔄 Retry")
-        self.proc_retry_btn.clicked.connect(self._retry_failed)
-        self.proc_retry_btn.setMinimumHeight(35)
-        self.proc_retry_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #0b7dda; }
-        """)
-        controls_layout.addWidget(self.proc_retry_btn)
-        
-        top_row.addLayout(controls_layout)
+
+        # New modern processing controls
+        self._setup_new_processing_controls(top_row)
+
         bar_layout.addLayout(top_row)
-        
+
         # Progress bar with detailed format (prominent)
         self.proc_progress = QProgressBar()
         self.proc_progress.setMinimum(1)  # Start from 1 instead of 0
         self.proc_progress.setFormat("%v / %m files (%p%) • Processing...")
-        self.proc_progress.setMinimumHeight(36)  # Slightly taller
+        self.proc_progress.setMinimumHeight(36)
         self.proc_progress.setTextVisible(True)
-        self.proc_progress.setStyleSheet("""
-            QProgressBar {
-                border: 2px solid rgba(255, 255, 255, 0.4);
-                border-radius: 8px;
-                text-align: center;
-                color: white;
-                font-weight: bold;
-                font-size: 11pt;
-                background-color: rgba(0, 0, 0, 0.3);
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4CAF50, stop:0.5 #66BB6A, stop:1 #81C784);
-                border-radius: 6px;
-                margin: 1px;
-            }
-            QProgressBar::chunk:disabled {
-                background: #666666;
-            }
-        """)
-        
-        # Progress animation timer for active processing
+        self._set_progress_bar_style(
+            self.proc_progress,
+            chunk_color=colors['accent'],
+            border_color=colors['accent'],
+            text_color=colors['text_primary'],
+        )
+
         self._progress_pulse_timer = QTimer()
         self._progress_pulse_timer.setInterval(800)
         self._progress_pulse_timer.timeout.connect(self._pulse_progress_bar)
         self._progress_pulse_effect = 0
         bar_layout.addWidget(self.proc_progress)
-        
+
         # Processing speed and ETA row
         speed_row = QHBoxLayout()
         speed_row.setSpacing(16)
-        
-        # Current processing stage indicator
+
         self.proc_stage_label = QLabel("🔍 Stage: --")
-        self.proc_stage_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.9);
-                font-size: 9pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_stage_label.setProperty("role", "metric")
         speed_row.addWidget(self.proc_stage_label)
-        
+
         self.proc_elapsed_label = QLabel("⏳ Elapsed: --")
-        self.proc_elapsed_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.9);
-                font-size: 9pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_elapsed_label.setProperty("role", "metric")
         speed_row.addWidget(self.proc_elapsed_label)
-        
+
         self.proc_speed_label = QLabel("⚡ Speed: --")
-        self.proc_speed_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.9);
-                font-size: 9pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_speed_label.setProperty("role", "metric")
         speed_row.addWidget(self.proc_speed_label)
-        
+
         self.proc_eta_label = QLabel("⏱️ ETA: --")
-        self.proc_eta_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.9);
-                font-size: 9pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_eta_label.setProperty("role", "metric")
         speed_row.addWidget(self.proc_eta_label)
-        
+
         speed_row.addStretch()
         bar_layout.addLayout(speed_row)
-        
+
         # Bottom row: Statistics
         stats_row = QHBoxLayout()
         stats_row.setSpacing(16)
-        
+
         self.proc_processed_label = QLabel("✓ Processed: 0")
-        self.proc_processed_label.setStyleSheet("""
-            QLabel {
-                color: #8BC34A;
-                font-size: 10pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_processed_label.setProperty("role", "stat")
+        self.proc_processed_label.setProperty("variant", "success")
         stats_row.addWidget(self.proc_processed_label)
-        
+
         self.proc_failed_label = QLabel("✗ Failed: 0")
-        self.proc_failed_label.setStyleSheet("""
-            QLabel {
-                color: #f44336;
-                font-size: 10pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_failed_label.setProperty("role", "stat")
+        self.proc_failed_label.setProperty("variant", "danger")
         stats_row.addWidget(self.proc_failed_label)
-        
+
         self.proc_skipped_label = QLabel("⊘ Skipped: 0")
-        self.proc_skipped_label.setStyleSheet("""
-            QLabel {
-                color: #FF9800;
-                font-size: 10pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self.proc_skipped_label.setProperty("role", "stat")
+        self.proc_skipped_label.setProperty("variant", "warning")
         stats_row.addWidget(self.proc_skipped_label)
-        
+
         stats_row.addStretch()
         bar_layout.addLayout(stats_row)
+
+        self._apply_processing_bar_theme()
     
+    def _apply_processing_bar_theme(self) -> None:
+        colors = self.APP_PALETTE
+        self.processing_status_bar.setStyleSheet(
+            f"""
+            QWidget#processingStatusBar {{
+                background-color: {colors['surface_alt']};
+                border: 1px solid {colors['dividers']};
+                border-radius: 12px;
+            }}
+            QLabel#processingStatusTitle {{
+                color: {colors['text_primary']};
+                font-size: 18pt;
+                font-weight: 600;
+            }}
+            QLabel#processingStatusSubtitle {{
+                color: {colors['text_secondary']};
+                font-size: 11pt;
+            }}
+            QLabel[role="metric"] {{
+                color: {colors['text_secondary']};
+                font-size: 10pt;
+                font-weight: 500;
+            }}
+            QLabel[role="stat"] {{
+                color: {colors['text_secondary']};
+                font-size: 10pt;
+                font-weight: 600;
+            }}
+            QLabel[variant="success"] {{
+                color: {colors['alert_success']};
+            }}
+            QLabel[variant="warning"] {{
+                color: {colors['alert_warning']};
+            }}
+            QLabel[variant="danger"] {{
+                color: {colors['alert_error']};
+            }}
+            """
+        )
+
+    def _apply_watch_theme(self, tab: QWidget) -> None:
+        colors = self.APP_PALETTE
+        tab.setStyleSheet(
+            f"""
+            QWidget#watchTab {{
+                background-color: {colors['canvas']};
+            }}
+            QLabel {{
+                color: {colors['text_secondary']};
+            }}
+            QLabel#watchHeader {{
+                color: {colors['text_primary']};
+                font-size: 18px;
+                font-weight: 600;
+            }}
+            QLabel[variant="warning"] {{
+                color: {colors['alert_warning']};
+                font-weight: 600;
+            }}
+            """
+        )
+
+    def _apply_results_theme(self, tab: QWidget) -> None:
+        colors = self.APP_PALETTE
+        tab.setStyleSheet(
+            f"""
+            QWidget#resultsTab {{
+                background-color: {colors['canvas']};
+            }}
+            QLabel {{
+                color: {colors['text_secondary']};
+            }}
+            QLabel#resultsHeader {{
+                color: {colors['text_primary']};
+                font-size: 18px;
+                font-weight: 600;
+            }}
+            QLabel#searchLabel {{
+                color: {colors['text_secondary']};
+            }}
+            QLabel#countLabel {{
+                color: {colors['text_secondary']};
+                font-weight: 500;
+            }}
+            QLabel#countValue {{
+                color: {colors['text_primary']};
+            }}
+            """
+        )
+
+    def _apply_global_theme(self) -> None:
+        colors = self.APP_PALETTE
+        if self.central_widget is not None:
+            self.central_widget.setObjectName("mainViewport")
+        self.setStyleSheet(
+            f"""
+            QMainWindow {{
+                background-color: {colors['canvas']};
+                color: {colors['text_primary']};
+            }}
+            QWidget#mainViewport {{
+                background-color: {colors['canvas']};
+            }}
+            QMenuBar {{
+                background-color: {colors['surface']};
+                color: {colors['text_secondary']};
+            }}
+            QMenuBar::item:selected {{
+                background-color: {colors['hover']};
+                color: {colors['text_primary']};
+            }}
+            QToolTip {{
+                background-color: {colors['surface_alt']};
+                color: {colors['text_primary']};
+                border: 1px solid {colors['dividers']};
+            }}
+            """
+        )
+
+    def _apply_tab_widget_theme(self) -> None:
+        colors = self.APP_PALETTE
+        self.tabs.setStyleSheet(
+            f"""
+            QTabWidget::pane {{
+                border: 1px solid {colors['dividers']};
+                border-radius: 10px;
+                padding: 6px;
+                background-color: {colors['surface']};
+            }}
+            """
+        )
+        self._base_tab_bar_style = (
+            f"""
+            QTabBar::tab {{
+                background-color: {colors['surface']};
+                color: {colors['text_secondary']};
+                padding: 8px 16px;
+                border: 1px solid {colors['surface']};
+                border-bottom: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                margin: 0 4px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {colors['surface_alt']};
+                color: {colors['text_primary']};
+                border-color: {colors['accent']};
+                font-weight: 600;
+            }}
+            QTabBar::tab:hover {{
+                background-color: {colors['hover']};
+                color: {colors['text_primary']};
+            }}
+            """
+        )
+        self.tabs.tabBar().setStyleSheet(self._base_tab_bar_style)
+
+    def _set_processing_status(self, text: str, variant: str = "primary") -> None:
+        colors = self.APP_PALETTE
+        color_map = {
+            "primary": colors['text_primary'],
+            "info": colors['accent'],
+            "success": colors['alert_success'],
+            "warning": colors['alert_warning'],
+            "error": colors['alert_error'],
+        }
+        self.proc_status_label.setText(text)
+        if variant == "primary":
+            self.proc_status_label.setStyleSheet("")
+        else:
+            color = color_map.get(variant, colors['text_primary'])
+            self.proc_status_label.setStyleSheet(
+                f"""
+                QLabel {{
+                    color: {color};
+                    font-size: 18pt;
+                    font-weight: 600;
+                    background: transparent;
+                }}
+                """
+            )
+
     def _auto_refresh_ui(self):
         """Auto-refresh UI elements to prevent lockups."""
         try:
@@ -481,19 +692,15 @@ class MainWindow(QMainWindow):
             notification_type: 'info', 'success', 'warning', or 'error'
             auto_hide: Auto-hide after milliseconds (0 = no auto-hide)
         """
-        # Set icon and styling based on type
-        if notification_type == "success":
-            icon = "✓"
-            text_color = "#4CAF50"
-        elif notification_type == "warning":
-            icon = "⚠"
-            text_color = "#FF9800"
-        elif notification_type == "error":
-            icon = "✕"
-            text_color = "#F44336"
-        else:  # info
-            icon = "ℹ"
-            text_color = "#2196F3"
+        colors = self.STATUS_COLORS
+        icon_map = {
+            "success": "✓",
+            "warning": "⚠",
+            "error": "✕",
+            "info": "ℹ",
+        }
+        status_color = colors.get(notification_type, colors["info"])
+        icon = icon_map.get(notification_type, icon_map["info"])
         
         # Update status bar notification
         self.status_notification_icon.setText(icon)
@@ -503,12 +710,21 @@ class MainWindow(QMainWindow):
         self.status_notification_close.setVisible(auto_hide == 0)
         
         # Set colors for status bar notification
-        self.notification_area.setStyleSheet(f"""
-            QLabel {{
-                color: {text_color};
-                font-weight: bold;
+        background = self.APP_PALETTE['surface_alt']
+        self.notification_area.setStyleSheet(
+            f"""
+            QWidget {{
+                background-color: {background};
+                border: 1px solid {status_color};
+                border-radius: 6px;
+                padding: 2px 6px;
             }}
-        """)
+            QLabel {{
+                color: {status_color};
+                font-weight: 600;
+            }}
+            """
+        )
         
         # Auto-hide if requested
         if auto_hide > 0:
@@ -521,15 +737,106 @@ class MainWindow(QMainWindow):
         self.notification_area.setStyleSheet("")
         self.status_notification_close.setVisible(False)  # Hide close button
     
+    def _setup_new_processing_controls(self, parent_layout: QHBoxLayout) -> None:
+        """Setup new modern processing controls."""
+        try:
+            logger.info("Setting up new processing controls...")
+            
+            # Create integration helper
+            self.processing_controls_integration = ProcessingControlsIntegration(self)
+            
+            # Create container for new controls
+            controls_container = QWidget()
+            controls_layout = QVBoxLayout(controls_container)
+            controls_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Install new controls widget
+            self.new_processing_controls = self.processing_controls_integration.install_new_controls(controls_container)
+            
+            # Hide old buttons since we have new controls
+            self.processing_controls_integration.hide_old_buttons()
+            
+            # Add to parent layout
+            parent_layout.addWidget(controls_container)
+            
+            # Connect state changes from orchestrator (will be connected later in _connect_signals)
+            logger.info("New processing controls installed successfully")
+            
+            # Set a flag to indicate we're using new controls
+            self._using_new_controls = True
+            
+        except Exception as e:
+            logger.error(f"Failed to setup new processing controls: {e}", exc_info=True)
+            # Fallback to create old controls if new ones fail
+            self._using_new_controls = False
+            self._create_fallback_controls(parent_layout)
+            
+    def _create_fallback_controls(self, parent_layout: QHBoxLayout) -> None:
+        """Create fallback controls if new controls fail to load."""
+        logger.info("Creating fallback processing controls")
+        
+        # Create simple fallback controls
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(6)
+
+        self.proc_start_btn = QPushButton("▶ Start")
+        self.proc_start_btn.clicked.connect(self._start_processing)
+        self.proc_start_btn.setMinimumHeight(36)
+        self._style_button(self.proc_start_btn, variant="primary")
+        controls_layout.addWidget(self.proc_start_btn)
+
+        self.proc_pause_btn = QPushButton("⏸ Pause")
+        self.proc_pause_btn.clicked.connect(self._pause_processing)
+        self.proc_pause_btn.setEnabled(False)
+        self.proc_pause_btn.setMinimumHeight(36)
+        self._style_button(self.proc_pause_btn, variant="warning")
+        controls_layout.addWidget(self.proc_pause_btn)
+
+        self.proc_stop_btn = QPushButton("⏹ Stop")
+        self.proc_stop_btn.clicked.connect(self._stop_processing)
+        self.proc_stop_btn.setEnabled(False)
+        self.proc_stop_btn.setMinimumHeight(36)
+        self._style_button(self.proc_stop_btn, variant="danger")
+        controls_layout.addWidget(self.proc_stop_btn)
+
+        self.proc_retry_btn = QPushButton("🔄 Retry")
+        self.proc_retry_btn.clicked.connect(self._retry_failed)
+        self.proc_retry_btn.setMinimumHeight(36)
+        self._style_button(self.proc_retry_btn, variant="secondary")
+        controls_layout.addWidget(self.proc_retry_btn)
+
+        parent_layout.addLayout(controls_layout)
+    
+    def _update_control_buttons_safe(self, start_enabled=None, pause_enabled=None, 
+                                   stop_enabled=None, retry_enabled=None):
+        """Safely update control button states for both new and old control systems."""
+        if self._using_new_controls:
+            # New controls handle their own state through the orchestrator
+            # No manual button state updates needed
+            pass
+        else:
+            # Update old control buttons if they exist
+            if start_enabled is not None and hasattr(self, 'proc_start_btn') and self.proc_start_btn:
+                self.proc_start_btn.setEnabled(start_enabled)
+            if pause_enabled is not None and hasattr(self, 'proc_pause_btn') and self.proc_pause_btn:
+                self.proc_pause_btn.setEnabled(pause_enabled)
+            if stop_enabled is not None and hasattr(self, 'proc_stop_btn') and self.proc_stop_btn:
+                self.proc_stop_btn.setEnabled(stop_enabled)
+            if retry_enabled is not None and hasattr(self, 'proc_retry_btn') and self.proc_retry_btn:
+                self.proc_retry_btn.setEnabled(retry_enabled)
+    
     def _create_watch_tab(self) -> QWidget:
         """Create Watch tab for folder management."""
         tab = QWidget()
+        tab.setObjectName("watchTab")
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         
         # Header
         header_layout = QHBoxLayout()
         header_label = QLabel("Watched Folders")
-        header_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        header_label.setObjectName("watchHeader")
         header_layout.addWidget(header_label)
         header_layout.addStretch()
         layout.addLayout(header_layout)
@@ -537,23 +844,28 @@ class MainWindow(QMainWindow):
         # Folder list
         self.folder_list = QListWidget()
         self.folder_list.setAlternatingRowColors(True)
+        self._style_list_widget(self.folder_list)
         layout.addWidget(self.folder_list)
         
         # Buttons
         button_layout = QHBoxLayout()
+        button_layout.setSpacing(10)
         
         self.add_folder_btn = QPushButton("Add Folder")
         self.add_folder_btn.clicked.connect(self._add_watch_folder)
+        self._style_button(self.add_folder_btn, variant="primary")
         button_layout.addWidget(self.add_folder_btn)
         
         self.remove_folder_btn = QPushButton("Remove Folder")
         self.remove_folder_btn.clicked.connect(self._remove_watch_folder)
         self.remove_folder_btn.setEnabled(False)
+        self._style_button(self.remove_folder_btn, variant="secondary")
         button_layout.addWidget(self.remove_folder_btn)
         
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setShortcut("F5")
         self.refresh_btn.clicked.connect(self._refresh_inventory)
+        self._style_button(self.refresh_btn, variant="secondary")
         button_layout.addWidget(self.refresh_btn)
         
         button_layout.addStretch()
@@ -561,7 +873,9 @@ class MainWindow(QMainWindow):
         
         # Inventory stats
         stats_group = QGroupBox("Inventory Statistics")
+        self._style_group_box(stats_group)
         stats_layout = QVBoxLayout(stats_group)
+        stats_layout.setSpacing(6)
         
         self.total_files_label = QLabel("Total Files: 0")
         stats_layout.addWidget(self.total_files_label)
@@ -570,42 +884,54 @@ class MainWindow(QMainWindow):
         stats_layout.addWidget(self.by_type_label)
         
         self.unanalyzed_label = QLabel("Unanalyzed: 0")
-        self.unanalyzed_label.setStyleSheet("font-weight: bold; color: #FF9800;")
+        self.unanalyzed_label.setProperty("variant", "warning")
         stats_layout.addWidget(self.unanalyzed_label)
         
         layout.addWidget(stats_group)
         
         # Load watched folders
         self._load_watched_folders()
+
+        self._apply_watch_theme(tab)
         
         return tab
     
     def _create_queue_tab(self) -> QWidget:
         """Create Queue tab for processing queue management."""
         tab = QWidget()
+        tab.setObjectName("queueTab")
+
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
         
-        # Header
         header_layout = QHBoxLayout()
         header_label = QLabel("Processing Queue")
-        header_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        header_label.setObjectName("queueHeader")
         header_layout.addWidget(header_label)
         header_layout.addStretch()
         layout.addLayout(header_layout)
         
-        # Queue table
         self.queue_table = QTableWidget()
+        self.queue_table.setObjectName("queueTable")
         self.queue_table.setColumnCount(5)
         self.queue_table.setHorizontalHeaderLabels(["File", "Type", "Status", "Progress", "Priority"])
         self.queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.queue_table.setColumnWidth(3, 120)  # Progress column fixed width
-        self.queue_table.setAlternatingRowColors(True)
+        self.queue_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.setColumnWidth(3, 160)
         self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.queue_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.queue_table.setAlternatingRowColors(True)
+        self.queue_table.setFocusPolicy(Qt.StrongFocus)
+        self.queue_table.setShowGrid(True)
         layout.addWidget(self.queue_table)
         
-        # Buttons
         button_layout = QHBoxLayout()
+        button_layout.setSpacing(12)
         
         self.enqueue_btn = QPushButton("Enqueue Selected Files")
         self.enqueue_btn.clicked.connect(self._enqueue_files)
@@ -618,12 +944,14 @@ class MainWindow(QMainWindow):
         
         self.move_up_btn = QPushButton("↑")
         self.move_up_btn.clicked.connect(self._move_queue_up)
-        self.move_up_btn.setMaximumWidth(40)
+        self.move_up_btn.setEnabled(False)
+        self.move_up_btn.setFixedWidth(42)
         button_layout.addWidget(self.move_up_btn)
         
         self.move_down_btn = QPushButton("↓")
         self.move_down_btn.clicked.connect(self._move_queue_down)
-        self.move_down_btn.setMaximumWidth(40)
+        self.move_down_btn.setEnabled(False)
+        self.move_down_btn.setFixedWidth(42)
         button_layout.addWidget(self.move_down_btn)
         
         self.clear_queue_btn = QPushButton("Clear Queue")
@@ -632,16 +960,398 @@ class MainWindow(QMainWindow):
         
         button_layout.addStretch()
         layout.addLayout(button_layout)
+
+        priority_layout = QHBoxLayout()
+        priority_layout.setSpacing(12)
+        priority_label = QLabel("Set Priority:")
+        priority_layout.addWidget(priority_label)
+
+        self.priority_combo = QComboBox()
+        for option in self.QUEUE_PRIORITY_LEVELS:
+            display_text = f"{option['icon']} {option['label']}"
+            self.priority_combo.addItem(display_text, option['value'])
+        self.priority_combo.setCurrentIndex(self._priority_index_for_value(DEFAULT_QUEUE_PRIORITY))
+        self.priority_combo.setToolTip("Choose the priority applied to selected queue items.")
+        priority_layout.addWidget(self.priority_combo)
+
+        self.priority_apply_btn = QPushButton("Apply Priority")
+        self.priority_apply_btn.clicked.connect(self._set_selected_priority)
+        self.priority_apply_btn.setEnabled(False)
+        priority_layout.addWidget(self.priority_apply_btn)
+        priority_layout.addStretch()
+        layout.addLayout(priority_layout)
         
-        # Progress
         self.queue_progress = QProgressBar()
-        self.queue_progress.setMinimum(1)  # Start from 1 instead of 0
-        self.queue_progress.setValue(1)    # Initial value of 1
+        self.queue_progress.setMinimum(1)
+        self.queue_progress.setValue(1)
         self.queue_progress.setFormat("%v / %m items")
         layout.addWidget(self.queue_progress)
+
+        self._apply_queue_theme(tab)
         
         return tab
     
+    def _apply_queue_theme(self, tab: QWidget) -> None:
+        """Apply shared queue styling to the tab and its widgets."""
+        colors = self.APP_PALETTE
+
+        tab.setStyleSheet(
+            f"""
+            QWidget#queueTab {{
+                background-color: {colors['canvas']};
+            }}
+            QLabel {{
+                color: {colors['text_secondary']};
+            }}
+            QLabel#queueHeader {{
+                color: {colors['text_primary']};
+                font-size: 18px;
+                font-weight: 600;
+            }}
+            """
+        )
+
+        self._style_table(self.queue_table, "queueTable")
+
+        for button in (self.enqueue_btn, self.dequeue_btn, self.move_up_btn,
+                        self.move_down_btn, self.clear_queue_btn, self.priority_apply_btn):
+            variant = "primary" if button in (self.enqueue_btn, self.priority_apply_btn) else "secondary"
+            if button is self.clear_queue_btn:
+                variant = "danger"
+            self._style_button(button, variant=variant)
+
+        self._style_combo(self.priority_combo)
+        self._set_progress_bar_style(self.queue_progress)
+
+    def _style_table(self, table: QTableWidget, object_name: str) -> None:
+        colors = self.APP_PALETTE
+        selector = f"QTableWidget#{object_name}"
+        table.setStyleSheet(
+            f"""
+            {selector} {{
+                background-color: {colors['surface']};
+                alternate-background-color: {colors['surface_alt']};
+                color: {colors['text_primary']};
+                gridline-color: {colors['dividers']};
+                selection-background-color: {colors['selected']};
+                selection-color: {colors['text_primary']};
+                border: 1px solid {colors['dividers']};
+                border-radius: 8px;
+            }}
+            {selector}::item:hover:!selected {{
+                background-color: {colors['hover']};
+            }}
+            {selector}::item:selected:hover {{
+                background-color: {colors['selected_hover']};
+            }}
+            {selector}::item:focus {{
+                outline: 2px solid {colors['focus']};
+                outline-offset: 1px;
+            }}
+            QHeaderView::section {{
+                background-color: {colors['surface_alt']};
+                color: {colors['text_primary']};
+                border: none;
+                border-bottom: 1px solid {colors['dividers']};
+                padding: 8px 10px;
+            }}
+            QTableCornerButton::section {{
+                background-color: {colors['surface_alt']};
+                border: none;
+            }}
+            """
+        )
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setHighlightSections(False)
+        table.setAlternatingRowColors(True)
+
+    def _style_button(self, button: QPushButton, *, variant: str = "secondary") -> None:
+        colors = self.APP_PALETTE
+        variants = {
+            "primary": {
+                "bg": colors['accent'],
+                "hover": colors['selected_hover'],
+                "pressed": colors['selected'],
+                "border": colors['accent'],
+                "text": colors['text_primary'],
+            },
+            "secondary": {
+                "bg": colors['surface_alt'],
+                "hover": colors['hover'],
+                "pressed": colors['pressed'],
+                "border": colors['dividers'],
+                "text": colors['text_primary'],
+            },
+            "ghost": {
+                "bg": "transparent",
+                "hover": colors['hover'],
+                "pressed": colors['pressed'],
+                "border": "transparent",
+                "text": colors['text_secondary'],
+            },
+            "danger": {
+                "bg": colors['alert_error'],
+                "hover": "#f05454",
+                "pressed": "#d83b3b",
+                "border": colors['alert_error'],
+                "text": colors['text_primary'],
+            },
+            "warning": {
+                "bg": colors['alert_warning'],
+                "hover": "#fb8f1a",
+                "pressed": "#d06d0e",
+                "border": colors['alert_warning'],
+                "text": colors['text_primary'],
+            },
+            "success": {
+                "bg": colors['alert_success'],
+                "hover": "#1ea558",
+                "pressed": "#1b8c4b",
+                "border": colors['alert_success'],
+                "text": colors['text_primary'],
+            },
+        }
+
+        style = variants.get(variant, variants['secondary'])
+        disabled_bg = colors['surface']
+        disabled_color = colors['text_disabled']
+
+        if variant != "ghost" and button.minimumHeight() <= 0:
+            button.setMinimumHeight(32)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {style['bg']};
+                color: {style['text']};
+                border: 1px solid {style['border']};
+                border-radius: 6px;
+                padding: 6px 14px;
+            }}
+            QPushButton:hover {{
+                background-color: {style['hover']};
+            }}
+            QPushButton:pressed {{
+                background-color: {style['pressed']};
+            }}
+            QPushButton:focus-visible {{
+                outline: 2px solid {colors['focus']};
+                outline-offset: 2px;
+            }}
+            QPushButton:disabled {{
+                background-color: {disabled_bg};
+                color: {disabled_color};
+                border-color: {colors['dividers']};
+            }}
+            """
+        )
+
+    def _style_combo(self, combo: QComboBox) -> None:
+        colors = self.APP_PALETTE
+        combo.setMinimumWidth(220)
+        combo.setMinimumHeight(32)
+        combo.setStyleSheet(
+            f"""
+            QComboBox {{
+                background-color: {colors['surface']};
+                color: {colors['text_primary']};
+                border: 1px solid {colors['dividers']};
+                border-radius: 6px;
+                padding: 6px 10px;
+            }}
+            QComboBox:hover {{
+                background-color: {colors['hover']};
+            }}
+            QComboBox:focus {{
+                border: 1px solid {colors['accent']};
+                outline: 2px solid {colors['focus']};
+                outline-offset: 2px;
+            }}
+            QComboBox::drop-down {{
+                background-color: {colors['surface_alt']};
+                border-left: 1px solid {colors['dividers']};
+                width: 26px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {colors['surface']};
+                border: 1px solid {colors['dividers']};
+                selection-background-color: {colors['selected']};
+                selection-color: {colors['text_primary']};
+            }}
+            """
+        )
+
+    def _style_line_edit(self, line_edit: QLineEdit) -> None:
+        colors = self.APP_PALETTE
+        line_edit.setMinimumHeight(32)
+        line_edit.setStyleSheet(
+            f"""
+            QLineEdit {{
+                background-color: {colors['surface']};
+                color: {colors['text_primary']};
+                border: 1px solid {colors['dividers']};
+                border-radius: 6px;
+                padding: 6px 10px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {colors['accent']};
+                outline: 2px solid {colors['focus']};
+                outline-offset: 1px;
+            }}
+            QLineEdit:disabled {{
+                background-color: {colors['surface_alt']};
+                color: {colors['text_disabled']};
+            }}
+            """
+        )
+
+    def _style_list_widget(self, list_widget: QListWidget) -> None:
+        colors = self.APP_PALETTE
+        list_widget.setStyleSheet(
+            f"""
+            QListWidget {{
+                background-color: {colors['surface']};
+                color: {colors['text_primary']};
+                border: 1px solid {colors['dividers']};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QListWidget::item:selected {{
+                background-color: {colors['selected']};
+            }}
+            QListWidget::item:hover {{
+                background-color: {colors['hover']};
+            }}
+            """
+        )
+
+    def _style_group_box(self, group_box: QGroupBox) -> None:
+        colors = self.APP_PALETTE
+        group_box.setStyleSheet(
+            f"""
+            QGroupBox {{
+                background-color: {colors['surface_alt']};
+                border: 1px solid {colors['dividers']};
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 12px;
+            }}
+            QGroupBox::title {{
+                color: {colors['text_secondary']};
+                subcontrol-origin: margin;
+                left: 16px;
+                padding: 0 6px;
+                background-color: {colors['surface_alt']};
+            }}
+            """
+        )
+
+    def _set_progress_bar_style(
+        self,
+        progress_bar: QProgressBar,
+        *,
+        chunk_color: Optional[str] = None,
+        border_color: Optional[str] = None,
+        text_color: Optional[str] = None,
+    ) -> None:
+        colors = self.APP_PALETTE
+        progress_bar.setMinimumHeight(26)
+        chunk = chunk_color or colors['accent']
+        border = border_color or colors['dividers']
+        text = text_color or colors['text_secondary']
+        progress_bar.setStyleSheet(
+            f"""
+            QProgressBar {{
+                background-color: {colors['surface_alt']};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 8px;
+                text-align: center;
+                font-weight: 500;
+            }}
+            QProgressBar::chunk {{
+                background-color: {chunk};
+                border-radius: 6px;
+                margin: 1px;
+            }}
+            """
+        )
+
+    def _priority_index_for_value(self, value: int) -> int:
+        for index, option in enumerate(self.QUEUE_PRIORITY_LEVELS):
+            if option['value'] == value:
+                return index
+        return 0
+
+    def _format_priority_text(self, priority: int) -> str:
+        label, _ = self.PRIORITY_LABELS.get(priority, (f"Priority {priority}", ""))
+        return f"{label} ({priority})"
+
+    def _priority_detail_text(self, priority: int) -> str:
+        detail = self.PRIORITY_LABELS.get(priority, ("", ""))[1]
+        return detail or "Custom priority"
+
+    def _row_color_for_priority(self, priority: int) -> str:
+        colors = self.QUEUE_PALETTE
+        if priority >= 10:
+            return colors['pressed']
+        if priority <= 0:
+            return colors['surface_alt']
+        return colors['surface']
+
+    def _create_queue_table_item(self, text: str, *, secondary: bool = False) -> QTableWidgetItem:
+        colors = self.QUEUE_PALETTE
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        item.setForeground(QColor(colors['text_secondary' if secondary else 'text_primary']))
+        return item
+
+    def _create_queue_progress_widget(self, item) -> QProgressBar:
+        progress_bar = QProgressBar()
+        status = item.status
+        
+        # Special handling: if we're in PAUSED state, force any PROCESSING items to display as PENDING
+        if status == QueueItemStatus.PROCESSING and hasattr(self, 'orchestrator') and self.orchestrator and \
+           (self.orchestrator.state == ProcessingState.PAUSED or self.orchestrator.state == ProcessingState.PAUSING):
+            # When paused, show any "processing" items as "pending" in the UI
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(0)
+            progress_bar.setFormat("Pending")
+            self._set_progress_bar_style(progress_bar)
+        elif status == QueueItemStatus.PROCESSING:
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(5)
+            progress_bar.setFormat("Processing...")
+            self._set_progress_bar_style(progress_bar)
+        elif status == QueueItemStatus.COMPLETED:
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(100)
+            progress_bar.setFormat("✓ Completed")
+            self._set_progress_bar_style(progress_bar, text_color=self.APP_PALETTE['text_primary'])
+        elif status == QueueItemStatus.FAILED:
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(100)
+            progress_bar.setFormat("✗ Failed")
+            error_color = self.APP_PALETTE['alert_error']
+            self._set_progress_bar_style(
+                progress_bar,
+                chunk_color=error_color,
+                border_color=error_color,
+                text_color=self.APP_PALETTE['text_primary'],
+            )
+        elif status == QueueItemStatus.SKIPPED:
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(0)
+            progress_bar.setFormat("Skipped")
+            self._set_progress_bar_style(progress_bar, chunk_color=self.APP_PALETTE['hover'])
+        else:
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(0)
+            progress_bar.setFormat("Pending")
+            self._set_progress_bar_style(progress_bar)
+
+        return progress_bar
+
     def _create_processing_tab(self) -> QWidget:
         """Create Processing tab for monitoring processing status."""
         tab = QWidget()
@@ -720,107 +1430,147 @@ class MainWindow(QMainWindow):
     def _create_results_tab(self) -> QWidget:
         """Create Results tab for browsing analyzed files."""
         tab = QWidget()
+        tab.setObjectName("resultsTab")
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         
-        # Header with search
+        # Header with actions
         header_layout = QHBoxLayout()
         header_label = QLabel("Analyzed Files")
-        header_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        header_label.setObjectName("resultsHeader")
         header_layout.addWidget(header_label)
+
         header_layout.addStretch()
-        
-        # Clear all button
-        clear_all_btn = QPushButton("🗑️ Clear All Results")
-        clear_all_btn.clicked.connect(self._clear_all_results)
-        clear_all_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #da190b; }
-        """)
-        header_layout.addWidget(clear_all_btn)
-        
-        # Refresh button
-        refresh_results_btn = QPushButton("🔄 Refresh")
-        refresh_results_btn.clicked.connect(self._refresh_results)
-        header_layout.addWidget(refresh_results_btn)
-        
+
+        self.results_refresh_button = QPushButton("🔄 Refresh")
+        self.results_refresh_button.setObjectName("refreshButton")
+        self.results_refresh_button.clicked.connect(self._refresh_results)
+        self._style_button(self.results_refresh_button, variant="secondary")
+        header_layout.addWidget(self.results_refresh_button)
+
+        self.results_clear_button = QPushButton("🗑️ Clear All Results")
+        self.results_clear_button.setObjectName("clearButton")
+        self.results_clear_button.clicked.connect(self._clear_all_results)
+        self._style_button(self.results_clear_button, variant="danger")
+        header_layout.addWidget(self.results_clear_button)
+
         layout.addLayout(header_layout)
         
         # Search bar
         search_layout = QHBoxLayout()
+        search_layout.setSpacing(10)
+
         search_label = QLabel("Search:")
+        search_label.setObjectName("searchLabel")
         search_layout.addWidget(search_label)
-        
+
         self.results_search_input = QLineEdit()
+        self.results_search_input.setObjectName("resultsSearchInput")
         self.results_search_input.setPlaceholderText("Search descriptions and tags...")
         self.results_search_input.returnPressed.connect(self._search_results)
+        self._style_line_edit(self.results_search_input)
         search_layout.addWidget(self.results_search_input)
-        
+
         self.search_results_btn = QPushButton("🔍 Search")
+        self.search_results_btn.setObjectName("searchButton")
         self.search_results_btn.clicked.connect(self._search_results)
+        self._style_button(self.search_results_btn, variant="primary")
         search_layout.addWidget(self.search_results_btn)
-        
+
         self.clear_search_btn = QPushButton("✕ Clear")
+        self.clear_search_btn.setObjectName("clearSearchButton")
         self.clear_search_btn.clicked.connect(self._clear_search)
+        self._style_button(self.clear_search_btn, variant="secondary")
         search_layout.addWidget(self.clear_search_btn)
-        
+
         layout.addLayout(search_layout)
         
         # Results table
         self.results_table = QTableWidget()
+        self.results_table.setObjectName("resultsTable")
         self.results_table.setColumnCount(6)
         self.results_table.setHorizontalHeaderLabels([
             "File Name", "Type", "Tags", "Description", "Confidence", "Analyzed"
         ])
-        
-        # Configure table
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.verticalHeader().setVisible(False)
-        
-        # Set column widths
+
         header = self.results_table.horizontalHeader()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)  # File Name
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)     # Type
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)  # Tags
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)   # Description
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)     # Confidence
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)     # Analyzed
-        
-        self.results_table.setColumnWidth(1, 80)   # Type
-        self.results_table.setColumnWidth(2, 200)  # Tags
-        self.results_table.setColumnWidth(4, 90)   # Confidence
-        self.results_table.setColumnWidth(5, 150)  # Analyzed
-        
-        # Connect double-click to view details
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+
+        self.results_table.setColumnWidth(1, 80)
+        self.results_table.setColumnWidth(2, 200)
+        self.results_table.setColumnWidth(4, 90)
+        self.results_table.setColumnWidth(5, 150)
+
         self.results_table.doubleClicked.connect(self._view_result_details)
-        
+
+        self._style_table(self.results_table, "resultsTable")
         layout.addWidget(self.results_table)
         
         # Statistics footer
         footer_layout = QHBoxLayout()
-        self.results_count_label = QLabel("Total files: 0")
+        footer_layout.setSpacing(10)
+        footer_layout.setContentsMargins(4, 0, 4, 0)
+
+        footer_label = QLabel("Results Count:")
+        footer_label.setObjectName("countLabel")
+        footer_layout.addWidget(footer_label)
+
+        self.results_count_label = QLabel("0")
+        self.results_count_label.setObjectName("countValue")
+        count_font = QFont(self.font())
+        count_font.setPointSize(12)
+        count_font.setWeight(QFont.Weight.DemiBold)
+        self.results_count_label.setFont(count_font)
         footer_layout.addWidget(self.results_count_label)
+
         footer_layout.addStretch()
-        
-        view_details_btn = QPushButton("View Details")
-        view_details_btn.clicked.connect(self._view_selected_result)
-        footer_layout.addWidget(view_details_btn)
-        
+
+        self.results_view_button = QPushButton("View Details")
+        self.results_view_button.setObjectName("viewButton")
+        self.results_view_button.clicked.connect(self._view_selected_result)
+        self.results_view_button.setMinimumHeight(32)
+        self._style_button(self.results_view_button, variant="secondary")
+        footer_layout.addWidget(self.results_view_button)
+
+        self.results_open_button = QPushButton("Open File")
+        self.results_open_button.setObjectName("openButton")
+        self.results_open_button.clicked.connect(self._open_result_file)
+        self.results_open_button.setMinimumHeight(32)
+        self._style_button(self.results_open_button, variant="secondary")
+        footer_layout.addWidget(self.results_open_button)
+
+        self.results_export_button = QPushButton("Export Selected")
+        self.results_export_button.setObjectName("exportButton")
+        self.results_export_button.clicked.connect(self._export_selected_results)
+        self.results_export_button.setMinimumHeight(32)
+        self._style_button(self.results_export_button, variant="primary")
+        footer_layout.addWidget(self.results_export_button)
+
+        self.results_delete_button = QPushButton("Delete Result")
+        self.results_delete_button.setObjectName("deleteButton")
+        self.results_delete_button.clicked.connect(self._delete_selected_result)
+        self.results_delete_button.setMinimumHeight(32)
+        self._style_button(self.results_delete_button, variant="danger")
+        footer_layout.addWidget(self.results_delete_button)
+
         layout.addLayout(footer_layout)
-        
-        # Load initial results
+
         QTimer.singleShot(500, self._refresh_results)
-        
+
+        self._apply_results_theme(tab)
+
         return tab
     
     def _create_menu_bar(self) -> None:
@@ -1072,10 +1822,28 @@ class MainWindow(QMainWindow):
     def _create_status_bar(self) -> None:
         """Create application status bar."""
         status_bar = QStatusBar()
+        colors = self.APP_PALETTE
+        status_bar.setStyleSheet(
+            f"""
+            QStatusBar {{
+                background-color: {colors['surface']};
+                color: {colors['text_secondary']};
+                border-top: 1px solid {colors['dividers']};
+            }}
+            QLabel#statusSeparator {{
+                color: {colors['dividers']};
+                padding: 0 6px;
+            }}
+            QLabel#statusPrimary {{
+                color: {colors['text_primary']};
+            }}
+            """
+        )
         self.setStatusBar(status_bar)
         
         # Add notification area (left-most, stretches to fill available space)
         self.notification_area = QWidget()
+        self.notification_area.setObjectName("statusNotification")
         notification_layout = QHBoxLayout(self.notification_area)
         notification_layout.setContentsMargins(2, 0, 2, 0)
         notification_layout.setSpacing(4)
@@ -1092,18 +1860,22 @@ class MainWindow(QMainWindow):
         # Add close button for notifications
         self.status_notification_close = QPushButton("✕")
         self.status_notification_close.setFixedSize(16, 16)
-        self.status_notification_close.setStyleSheet("""
-            QPushButton {
+        self.status_notification_close.setStyleSheet(
+            f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
                 font-size: 10px;
                 padding: 0px;
-            }
-            QPushButton:hover {
-                background: rgba(255, 255, 255, 0.2);
+                color: {colors['text_secondary']};
+            }}
+            QPushButton:hover {{
+                background-color: {colors['hover']};
                 border-radius: 8px;
-            }
-        """)
+                color: {colors['text_primary']};
+            }}
+            """
+        )
         self.status_notification_close.clicked.connect(self._hide_notification)
         self.status_notification_close.setVisible(False)  # Hide until needed
         notification_layout.addWidget(self.status_notification_close)
@@ -1111,34 +1883,28 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self.notification_area, 1)  # Stretch to fill available space
         
         # Add permanent widgets (right side)
-        status_bar.addPermanentWidget(QLabel("●"))
+        separator_one = QLabel("●")
+        separator_one.setObjectName("statusSeparator")
+        status_bar.addPermanentWidget(separator_one)
         
         # AI Model status button
         self.ai_status_btn = QPushButton("● AI Models")
         self.ai_status_btn.setFlat(True)
-        self.ai_status_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                border: none;
-                padding: 4px 12px;
-                color: #888888;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background: rgba(128, 128, 128, 0.2);
-                border-radius: 3px;
-            }
-        """)
+        self._style_button(self.ai_status_btn, variant="ghost")
         self.ai_status_btn.clicked.connect(self._show_ai_model_dialog)
         status_bar.addPermanentWidget(self.ai_status_btn)
         
         self.inventory_status_label = QLabel("Files: 0")
+        self.inventory_status_label.setObjectName("statusPrimary")
         self.inventory_status_label.setStyleSheet("padding: 0 8px;")
         status_bar.addPermanentWidget(self.inventory_status_label)
         
-        status_bar.addPermanentWidget(QLabel("●"))
+        separator_two = QLabel("●")
+        separator_two.setObjectName("statusSeparator")
+        status_bar.addPermanentWidget(separator_two)
         
         self.processing_status_bar_label = QLabel("Idle")
+        self.processing_status_bar_label.setObjectName("statusPrimary")
         self.processing_status_bar_label.setStyleSheet("padding: 0 8px;")
         status_bar.addPermanentWidget(self.processing_status_bar_label)
     
@@ -1179,6 +1945,15 @@ class MainWindow(QMainWindow):
             self.orchestrator.review_required.connect(self._on_review_required)
             self.orchestrator.progress_updated.connect(self._on_processing_progress)
             self.orchestrator.state_changed.connect(self._on_processing_state_changed)
+            
+            # Connect new processing controls to orchestrator state changes
+            if self.processing_controls_integration:
+                self.orchestrator.state_changed.connect(
+                    self.processing_controls_integration.handle_state_change,
+                    Qt.QueuedConnection  # Ensure thread-safe execution
+                )
+                # Sync initial state
+                self.processing_controls_integration.sync_state_with_orchestrator()
         
         # UI signals
         self.folder_list.itemSelectionChanged.connect(self._on_folder_selection_changed)
@@ -1228,20 +2003,53 @@ class MainWindow(QMainWindow):
     
     def _animate_processing_activity(self):
         """Animate activity indicator during processing to show it's working."""
+        # Check if the orchestrator exists and if we're not in RUNNING state
+        if not self.orchestrator:
+            return
+            
+        # Handle different states
+        if self.orchestrator.state == ProcessingState.PAUSED:
+            # If paused, show "PAUSED" (without animation spinner)
+            self._set_processing_status("⚙️ PAUSED", "warning")
+            self.processing_status_bar_label.setText("Paused")
+            
+            # Stop the animation timer to prevent further updates
+            if hasattr(self, '_activity_timer') and self._activity_timer.isActive():
+                self._activity_timer.stop()
+            return
+        elif self.orchestrator.state == ProcessingState.STOPPED:
+            # If stopped, show "STOPPED" (without animation spinner)
+            self._set_processing_status("⚙️ STOPPED", "error")
+            self.processing_status_bar_label.setText("Stopped")
+            
+            # Stop the animation timer to prevent further updates
+            if hasattr(self, '_activity_timer') and self._activity_timer.isActive():
+                self._activity_timer.stop()
+            return
+        elif self.orchestrator.state == ProcessingState.IDLE:
+            # If idle, show "IDLE" (without animation spinner)
+            self._set_processing_status("⚙️ IDLE")
+            self.processing_status_bar_label.setText("Idle")
+            
+            # Stop the animation timer to prevent further updates
+            if hasattr(self, '_activity_timer') and self._activity_timer.isActive():
+                self._activity_timer.stop()
+            return
+            
+        # Only proceed with animation for RUNNING, PAUSING, or STOPPING states
         # Cycle through animation frames (Braille spinner)
         frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self._activity_frame = (self._activity_frame + 1) % len(frames)
         spinner = frames[self._activity_frame]
         
         # Update status with spinner based on current state
-        current_text = self.proc_status_label.text()
-        if "PAUSING" in current_text:
-            self.proc_status_label.setText(f"{spinner} PAUSING...")
-        elif "STOPPING" in current_text:
-            self.proc_status_label.setText(f"{spinner} STOPPING...")
-        else:
-            # Normal RUNNING state
-            self.proc_status_label.setText(f"{spinner} RUNNING")
+        current_state = self.orchestrator.state
+        if current_state == ProcessingState.PAUSING:
+            self._set_processing_status(f"{spinner} PAUSING...", "warning")
+        elif current_state == ProcessingState.STOPPING:
+            self._set_processing_status(f"{spinner} STOPPING...", "error")
+        else:  # RUNNING state
+            self._set_processing_status(f"{spinner} RUNNING", "info")
     
     def _check_ai_status(self):
         """Check AI model status in background thread to avoid blocking UI."""
@@ -1273,37 +2081,40 @@ class MainWindow(QMainWindow):
         """
         self._ai_status_ok = status_ok
         
+        colors = self.APP_PALETTE
         if status_ok:
-            # Green dot
-            self.ai_status_btn.setStyleSheet("""
-                QPushButton {
+            self.ai_status_btn.setStyleSheet(
+                f"""
+                QPushButton {{
                     background: transparent;
                     border: none;
                     padding: 4px 12px;
-                    color: #4CAF50;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background: rgba(76, 175, 80, 0.2);
-                    border-radius: 3px;
-                }
-            """)
+                    color: {colors['alert_success']};
+                    font-weight: 600;
+                }}
+                QPushButton:hover {{
+                    background-color: {colors['hover']};
+                    border-radius: 6px;
+                }}
+                """
+            )
             self.ai_status_btn.setToolTip("AI Models: Connected ✓\nClick to manage models")
         else:
-            # Red dot
-            self.ai_status_btn.setStyleSheet("""
-                QPushButton {
+            self.ai_status_btn.setStyleSheet(
+                f"""
+                QPushButton {{
                     background: transparent;
                     border: none;
                     padding: 4px 12px;
-                    color: #F44336;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background: rgba(244, 67, 54, 0.2);
-                    border-radius: 3px;
-                }
-            """)
+                    color: {colors['alert_error']};
+                    font-weight: 600;
+                }}
+                QPushButton:hover {{
+                    background-color: {colors['hover']};
+                    border-radius: 6px;
+                }}
+                """
+            )
             self.ai_status_btn.setToolTip("AI Models: Not Connected ✕\nClick to troubleshoot")
     
     def _on_settings_changed(self):
@@ -1456,7 +2267,8 @@ class MainWindow(QMainWindow):
             if self._glow_timer.isActive():
                 self._glow_timer.stop()
             # Reset stylesheet
-            self.tabs.tabBar().setStyleSheet("")
+            if self._base_tab_bar_style:
+                self.tabs.tabBar().setStyleSheet(self._base_tab_bar_style)
     
     def _animate_queue_glow(self):
         """Animate the glowing effect on the queue tab."""
@@ -1470,20 +2282,23 @@ class MainWindow(QMainWindow):
             self._glow_intensity = 30
             self._glow_direction = 1
         
-        # Calculate color with intensity
-        # From dim green (0, 80, 0) to bright green (0, 255, 0)
-        green_value = int(80 + (175 * self._glow_intensity / 100))
-        
-        # Apply stylesheet with current intensity
-        self.tabs.tabBar().setStyleSheet(f"""
-            QTabBar::tab {{
-                font-size: 11pt;
-            }}
+        accent_hex = self.APP_PALETTE['focus'].lstrip('#')
+        accent_r = int(accent_hex[0:2], 16)
+        accent_g = int(accent_hex[2:4], 16)
+        accent_b = int(accent_hex[4:6], 16)
+        alpha = 0.35 + (0.45 * self._glow_intensity / 100)
+        glow_color = f"rgba({accent_r}, {accent_g}, {accent_b}, {alpha:.2f})"
+
+        glow_style = (
+            f"""
             QTabBar::tab:nth-child(2) {{
-                color: rgb(0, {green_value}, 0);
-                font-weight: bold;
+                color: {glow_color};
+                font-weight: 600;
             }}
-        """)
+            """
+        )
+
+        self.tabs.tabBar().setStyleSheet(self._base_tab_bar_style + glow_style)
 
     
     def _on_watcher_error(self, error_code, message):
@@ -1494,95 +2309,61 @@ class MainWindow(QMainWindow):
     # Queue tab handlers
     def _refresh_queue_table(self):
         """Refresh queue table display."""
-        self.queue_table.setRowCount(0)
-        self._file_progress_bars.clear()  # Clear old progress bar references
         items = self.queue_manager.get_queue_items()
-        
+
+        previously_selected = set()
+        selection_model = self.queue_table.selectionModel()
+        if selection_model:
+            for index in selection_model.selectedRows():
+                if 0 <= index.row() < len(items):
+                    previously_selected.add(items[index.row()].file_path)
+
+        self.queue_table.setRowCount(0)
+        self._file_progress_bars.clear()
+
         for item in items:
             row = self.queue_table.rowCount()
             self.queue_table.insertRow(row)
-            
-            # File name
-            file_name = Path(item.file_path).name
-            self.queue_table.setItem(row, 0, QTableWidgetItem(file_name))
-            
-            # Type
-            self.queue_table.setItem(row, 1, QTableWidgetItem(item.file_type or '-'))
-            
-            # Status
-            self.queue_table.setItem(row, 2, QTableWidgetItem(item.status.value))
-            
-            # Progress bar
-            progress_bar = QProgressBar()
-            progress_bar.setMinimum(1)  # Start from 1 instead of 0
-            progress_bar.setMaximum(100)
-            progress_bar.setValue(1)    # Initial value of 1 instead of 0
-            progress_bar.setTextVisible(True)
-            progress_bar.setFormat("")  # Empty initially
-            
-            # Style based on status
-            if item.status == QueueItemStatus.PROCESSING:
-                progress_bar.setStyleSheet("""
-                    QProgressBar {
-                        border: 1px solid #3498db;
-                        border-radius: 3px;
-                        text-align: center;
-                        background-color: #ecf0f1;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #3498db;
-                    }
-                """)
-                progress_bar.setFormat("Processing...")
-            elif item.status == QueueItemStatus.COMPLETED:
-                progress_bar.setValue(100)
-                progress_bar.setStyleSheet("""
-                    QProgressBar {
-                        border: 1px solid #27ae60;
-                        border-radius: 3px;
-                        text-align: center;
-                        background-color: #ecf0f1;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #27ae60;
-                    }
-                """)
-                progress_bar.setFormat("✓ Done")
-            elif item.status == QueueItemStatus.FAILED:
-                progress_bar.setValue(100)
-                progress_bar.setStyleSheet("""
-                    QProgressBar {
-                        border: 1px solid #e74c3c;
-                        border-radius: 3px;
-                        text-align: center;
-                        background-color: #ecf0f1;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #e74c3c;
-                    }
-                """)
-                progress_bar.setFormat("✗ Failed")
+
+            file_item = self._create_queue_table_item(Path(item.file_path).name)
+            file_item.setToolTip(item.file_path)
+            file_item.setData(Qt.UserRole, item.file_path)
+            self.queue_table.setItem(row, 0, file_item)
+
+            type_item = self._create_queue_table_item(item.file_type or "-", secondary=True)
+            self.queue_table.setItem(row, 1, type_item)
+
+            # Special handling for status column - show PROCESSING as PENDING when paused
+            if item.status == QueueItemStatus.PROCESSING and hasattr(self, 'orchestrator') and self.orchestrator and \
+               (self.orchestrator.state == ProcessingState.PAUSED or self.orchestrator.state == ProcessingState.PAUSING):
+                status_label = QueueItemStatus.PENDING.value.replace("_", " ").title()
+                status_secondary = True
             else:
-                # Pending/Skipped
-                progress_bar.setStyleSheet("""
-                    QProgressBar {
-                        border: 1px solid #95a5a6;
-                        border-radius: 3px;
-                        text-align: center;
-                        background-color: #ecf0f1;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #95a5a6;
-                    }
-                """)
-                progress_bar.setFormat("—")
+                status_label = item.status.value.replace("_", " ").title()
+                status_secondary = item.status in (QueueItemStatus.PENDING, QueueItemStatus.SKIPPED)
             
+            status_item = self._create_queue_table_item(status_label, secondary=status_secondary)
+            self.queue_table.setItem(row, 2, status_item)
+
+            progress_bar = self._create_queue_progress_widget(item)
             self.queue_table.setCellWidget(row, 3, progress_bar)
             self._file_progress_bars[item.file_path] = progress_bar
-            
-            # Priority
-            self.queue_table.setItem(row, 4, QTableWidgetItem(str(item.priority)))
-        
+
+            priority_item = self._create_queue_table_item(self._format_priority_text(item.priority))
+            priority_item.setToolTip(self._priority_detail_text(item.priority))
+            self.queue_table.setItem(row, 4, priority_item)
+
+            row_brush = QBrush(QColor(self._row_color_for_priority(item.priority)))
+            for col_index in (0, 1, 2, 4):
+                cell = self.queue_table.item(row, col_index)
+                if cell:
+                    cell.setBackground(row_brush)
+
+            if item.file_path in previously_selected:
+                self.queue_table.selectRow(row)
+
+        self.queue_table.resizeRowsToContents()
+        self._on_queue_selection_changed()
         logger.debug(f"Queue table refreshed: {len(items)} items")
     
     def _show_supported_file_types_info(self):
@@ -1655,56 +2436,132 @@ class MainWindow(QMainWindow):
         )
         
         if files:
-            count = self.queue_manager.add_batch(files)
+            priority_value = self._prompt_priority_for_new_items(len(files))
+            if priority_value is None:
+                self.show_status_message("Enqueue cancelled", "warning")
+                return
+
+            count = self.queue_manager.add_batch(files, priority_value)
             if count < len(files):
                 skipped = len(files) - count
                 self.show_status_message(f"Enqueued {count} files, skipped {skipped} unsupported files")
-                
-                # Show info about supported file types if files were skipped
+
                 if skipped > 0:
                     QTimer.singleShot(500, self._show_supported_file_types_info)
             else:
-                self.show_status_message(f"Enqueued {count} files")
-            
-            logger.info(f"Enqueued {count}/{len(files)} files")
-            self._refresh_queue_table()
-            self._update_queue_badge()
+                self.show_status_message(
+                    f"Enqueued {count} files at {self._format_priority_text(priority_value)}"
+                )
+
+            logger.info(f"Enqueued {count}/{len(files)} files with priority {priority_value}")
+            self.priority_combo.setCurrentIndex(self._priority_index_for_value(priority_value))
             self._refresh_queue_table()
             self._update_queue_badge()
     
     def _dequeue_files(self):
         """Remove selected files from queue."""
-        selected_rows = set(item.row() for item in self.queue_table.selectedItems())
-        
-        for row in sorted(selected_rows, reverse=True):
-            file_item = self.queue_table.item(row, 0)
-            if file_item:
-                # Find full path (simplified - would need proper mapping)
-                items = self.queue_manager.get_queue_items()
-                if row < len(items):
-                    self.queue_manager.remove_item(items[row].file_path)
+        selection_model = self.queue_table.selectionModel()
+        if not selection_model:
+            return
+
+        selected_rows = sorted((index.row() for index in selection_model.selectedRows()), reverse=True)
+        if not selected_rows:
+            return
+
+        items = self.queue_manager.get_queue_items()
+        removed = 0
+        for row in selected_rows:
+            if 0 <= row < len(items):
+                if self.queue_manager.remove_item(items[row].file_path):
+                    removed += 1
+
+        if removed:
+            self.show_status_message(f"Removed {removed} item(s) from the queue")
         
         self._refresh_queue_table()
         self._update_queue_badge()
     
     def _move_queue_up(self):
         """Move selected queue item up."""
-        current_row = self.queue_table.currentRow()
-        if current_row > 0:
-            items = self.queue_manager.get_queue_items()
-            if current_row < len(items):
-                self.queue_manager.move_up(items[current_row].file_path)
-                self._refresh_queue_table()
-                self.queue_table.selectRow(current_row - 1)
+        selection_model = self.queue_table.selectionModel()
+        if not selection_model:
+            return
+
+        selected_rows = sorted(index.row() for index in selection_model.selectedRows())
+        if not selected_rows:
+            return
+
+        current_row = selected_rows[0]
+        if current_row <= 0:
+            return
+
+        items = self.queue_manager.get_queue_items()
+        if current_row < len(items) and self.queue_manager.move_up(items[current_row].file_path):
+            self._refresh_queue_table()
+            self.queue_table.selectRow(current_row - 1)
+            self._on_queue_selection_changed()
     
     def _move_queue_down(self):
         """Move selected queue item down."""
-        current_row = self.queue_table.currentRow()
+        selection_model = self.queue_table.selectionModel()
+        if not selection_model:
+            return
+
+        selected_rows = sorted(index.row() for index in selection_model.selectedRows())
+        if not selected_rows:
+            return
+
+        current_row = selected_rows[-1]
         items = self.queue_manager.get_queue_items()
-        if current_row >= 0 and current_row < len(items) - 1:
-            self.queue_manager.move_down(items[current_row].file_path)
+        if current_row < 0 or current_row >= len(items) - 1:
+            return
+
+        if self.queue_manager.move_down(items[current_row].file_path):
             self._refresh_queue_table()
             self.queue_table.selectRow(current_row + 1)
+            self._on_queue_selection_changed()
+
+    def _set_selected_priority(self):
+        """Apply the chosen priority to all selected queue items."""
+        if not self.priority_combo:
+            return
+
+        selection_model = self.queue_table.selectionModel()
+        if not selection_model or not selection_model.hasSelection():
+            return
+
+        selected_rows = sorted(index.row() for index in selection_model.selectedRows())
+        items = self.queue_manager.get_queue_items()
+        selected_paths = [items[row].file_path for row in selected_rows if 0 <= row < len(items)]
+
+        if not selected_paths:
+            return
+
+        priority_value = self.priority_combo.currentData()
+        if priority_value is None:
+            return
+
+        updated = self.queue_manager.set_batch_priority(selected_paths, priority_value)
+        if updated:
+            display_text = self._format_priority_text(priority_value)
+            self.show_status_message(f"Updated {updated} item(s) to {display_text}")
+            self.priority_combo.setCurrentIndex(self._priority_index_for_value(priority_value))
+            self._refresh_queue_table()
+            self._update_queue_badge()
+
+    def _prompt_priority_for_new_items(self, count: int) -> Optional[int]:
+        """Prompt the user for a priority selection before enqueueing."""
+        dialog = PrioritySelectionDialog(
+            self.QUEUE_PALETTE,
+            self.QUEUE_PRIORITY_LEVELS,
+            DEFAULT_QUEUE_PRIORITY,
+            self
+        )
+        plural = "s" if count != 1 else ""
+        dialog.set_message(f"Assign a priority for the {count} file{plural} you are adding.")
+        if dialog.exec() == QDialog.Accepted:
+            return dialog.selected_priority()
+        return None
     
     def _clear_queue(self):
         """Clear the processing queue."""
@@ -1719,8 +2576,19 @@ class MainWindow(QMainWindow):
     
     def _on_queue_selection_changed(self):
         """Handle queue selection change."""
-        has_selection = bool(self.queue_table.selectedItems())
+        selection_model = self.queue_table.selectionModel()
+        has_selection = bool(selection_model and selection_model.hasSelection())
+        current_row = self.queue_table.currentRow()
+        row_count = self.queue_table.rowCount()
+
         self.dequeue_btn.setEnabled(has_selection)
+        if self.priority_apply_btn:
+            self.priority_apply_btn.setEnabled(has_selection)
+
+        can_move_up = has_selection and current_row > 0
+        can_move_down = has_selection and 0 <= current_row < row_count - 1
+        self.move_up_btn.setEnabled(can_move_up)
+        self.move_down_btn.setEnabled(can_move_down)
     
     def _on_queue_item_added(self, item):
         """Handle queue item added signal."""
@@ -1746,7 +2614,7 @@ class MainWindow(QMainWindow):
     
     # Processing tab handlers
     def _start_processing(self):
-        """Start or resume processing the queue."""
+        """Start processing the queue."""
         if not self.orchestrator:
             self._show_notification(
                 "Processing not available. Please check OCR and LLM configuration in Settings.",
@@ -1755,48 +2623,132 @@ class MainWindow(QMainWindow):
             )
             return
         
-        # Check if we're resuming from paused state (Processing tab button)
-        if self.proc_start_btn.text() == "▶ Resume":
-            # Emit signal to trigger resume_processing on worker thread
-            logger.info("Emitting resume_processing_signal...")
-            self.resume_processing_signal.emit()
+        # Check if we're resuming from paused state
+        # For new controls, check orchestrator state; for old controls, check button text
+        should_resume = False
+        if self._using_new_controls:
+            # With new controls, check the orchestrator state
+            should_resume = (hasattr(self.orchestrator, 'state') and 
+                           self.orchestrator.state == ProcessingState.PAUSED)
+        elif hasattr(self, 'proc_start_btn') and self.proc_start_btn:
+            # With old controls, check button text
+            should_resume = self.proc_start_btn.text() == "▶ Resume"
+        
+        if should_resume:
+            self._resume_processing()
         else:
             # Emit signal to trigger start_processing on worker thread
             logger.info("Emitting start_processing_signal...")
             self.start_processing_signal.emit()
     
+    def _resume_processing(self):
+        """Resume processing from paused state."""
+        if not self.orchestrator:
+            logger.warning("Cannot resume: orchestrator not available")
+            return
+            
+        if not self._validate_state_transition(self.orchestrator.state, ProcessingState.RUNNING, "resume"):
+            return
+        
+        # Emit signal to trigger resume_processing on worker thread
+        logger.info("Emitting resume_processing_signal...")
+        self.resume_processing_signal.emit()
+    
+    def _validate_state_transition(self, current_state, target_state, action):
+        """Validate if a state transition is allowed."""
+        logger.info(f"Validating state transition: {current_state} -> {target_state} for action '{action}'")
+        
+        valid_transitions = {
+            ProcessingState.IDLE: [ProcessingState.RUNNING],
+            ProcessingState.RUNNING: [ProcessingState.PAUSING, ProcessingState.STOPPING],
+            ProcessingState.PAUSING: [ProcessingState.PAUSED],
+            ProcessingState.PAUSED: [ProcessingState.RUNNING, ProcessingState.STOPPING],
+            ProcessingState.STOPPING: [ProcessingState.STOPPED],
+            ProcessingState.STOPPED: [ProcessingState.IDLE, ProcessingState.RUNNING],
+        }
+        
+        allowed_targets = valid_transitions.get(current_state, [])
+        logger.info(f"Allowed transitions from {current_state}: {allowed_targets}")
+        
+        if target_state not in allowed_targets:
+            logger.error(f"Invalid state transition for {action}: {current_state} -> {target_state}")
+            self._show_notification(
+                f"Cannot {action}: invalid state transition from {current_state.value}",
+                "error",
+                auto_hide=3000
+            )
+            return False
+        
+        logger.info(f"State transition validation passed for {action}")
+        return True
+    
     def _pause_processing(self):
-        """Pause processing."""
-        if self.orchestrator:
-            # Emit signal to trigger pause_processing on worker thread
-            # The orchestrator will emit state_changed signal which updates UI
-            self.pause_processing_signal.emit()
-            logger.info("Processing pause requested")
+        """Toggle between pause and resume processing."""
+        try:
+            logger.info(f"_pause_processing called")
+            # Only log button state if using old controls
+            if not self._using_new_controls and hasattr(self, 'proc_pause_btn') and self.proc_pause_btn:
+                logger.info(f"Pause button enabled: {self.proc_pause_btn.isEnabled()}")
+            
+            if not hasattr(self, 'orchestrator') or self.orchestrator is None:
+                logger.error("Orchestrator not available")
+                self._show_notification("Processing orchestrator not available", "error", auto_hide=3000)
+                return
+            
+            logger.info(f"Current orchestrator state: {self.orchestrator.state}")
+            
+            # Check current state to determine if we need to pause or resume
+            if self.orchestrator.state == ProcessingState.RUNNING:
+                logger.info("State is RUNNING, attempting to pause...")
+                # Validate pause transition
+                if not self._validate_state_transition(self.orchestrator.state, ProcessingState.PAUSING, "pause"):
+                    logger.warning("State transition validation failed for pause")
+                    return
+                # Pause processing - let state machine handle UI updates
+                logger.info("Processing pause requested - emitting pause_processing_signal")
+                try:
+                    self.pause_processing_signal.emit()
+                    logger.info("pause_processing_signal emitted successfully")
+                except Exception as e:
+                    logger.error(f"Failed to emit pause_processing_signal: {e}")
+                    
+            elif self.orchestrator.state == ProcessingState.PAUSED:
+                # Resume processing using the dedicated method
+                logger.info("Processing resume requested via pause button")
+                self._resume_processing()
+            else:
+                logger.warning(f"Cannot pause/resume from state: {self.orchestrator.state}")
+                self._show_notification(f"Cannot pause from state: {self.orchestrator.state.value}", "warning", auto_hide=3000)
+                
+        except Exception as e:
+            logger.error(f"Error in _pause_processing: {e}")
+            self._show_notification(f"Error in pause processing: {str(e)}", "error", auto_hide=5000)
     
     def _stop_processing(self):
         """Stop processing."""
-        if self.orchestrator:
-            # Update UI immediately to show stop is pending with spinner
-            self.proc_status_label.setText("⠋ STOPPING...")
-            self.proc_status_label.setStyleSheet("""
-                QLabel {
-                    color: #F44336;
-                    font-size: 18pt;
-                    font-weight: bold;
-                    background: transparent;
-                }
-            """)
-            self.processing_status_bar_label.setText("Stopping...")
+        if not self.orchestrator:
+            logger.warning("Cannot stop: orchestrator not available")
+            return
             
-            # Update buttons
-            self.proc_start_btn.setEnabled(False)
-            self.proc_pause_btn.setEnabled(False)
-            self.proc_stop_btn.setEnabled(False)
-            self.proc_retry_btn.setEnabled(False)  # Disable retry during stopping
+        # Validate stop transition
+        if not self._validate_state_transition(self.orchestrator.state, ProcessingState.STOPPING, "stop"):
+            return
             
-            # Emit signal to trigger stop_processing on worker thread
-            self.stop_processing_signal.emit()
-            logger.info("Processing stop requested")
+        # Update UI immediately to show stop is pending with spinner
+        self._set_processing_status("⠋ STOPPING...", "error")
+        self.processing_status_bar_label.setText("Stopping...")
+        
+        # Update buttons safely
+        self._update_control_buttons_safe(
+            start_enabled=False,
+            pause_enabled=False,
+            stop_enabled=False,
+            retry_enabled=False  # Disable retry during stopping
+        )
+        
+        # Emit signal to trigger stop_processing on worker thread
+        self.stop_processing_signal.emit()
+        logger.info("Processing stop requested")
     
     def _retry_failed(self):
         """Retry failed items."""
@@ -1819,12 +2771,24 @@ class MainWindow(QMainWindow):
         # This is now just a backup handler - state change should handle it
         logger.debug("_on_processing_started called - delegating to state handler")
         if hasattr(self, 'orchestrator') and hasattr(self.orchestrator, 'state'):
+            # Import the correct ProcessingState from orchestrator
+            try:
+                from src.services.processing_orchestrator import ProcessingState as OrchestratorState
+                expected_state = OrchestratorState.RUNNING
+            except ImportError:
+                # Fallback - try to compare by string representation
+                expected_state = "RUNNING"
+                
             # Just double-check that we're actually in RUNNING state
-            if self.orchestrator.state != ProcessingState.RUNNING:
-                logger.warning(f"Expected RUNNING state but got {self.orchestrator.state}, fixing...")
-                # Force state to RUNNING
-                self.orchestrator.state = ProcessingState.RUNNING
-                self._on_processing_state_changed(ProcessingState.RUNNING)
+            if self.orchestrator.state != expected_state:
+                # Check by string representation as fallback
+                state_str = str(self.orchestrator.state).split('.')[-1]  # Get enum name
+                if state_str != "RUNNING":
+                    logger.warning(f"Expected RUNNING state but got {self.orchestrator.state}, fixing...")
+                    # Force state to RUNNING
+                    self.orchestrator.state = expected_state
+                
+            self._on_processing_state_changed(ProcessingState.RUNNING)
         else:
             logger.warning("Orchestrator not available for state check")
         
@@ -1843,49 +2807,33 @@ class MainWindow(QMainWindow):
         logger.info("UI updated: processing started")
     
     def _on_processing_paused(self):
-        """Handle processing paused signal."""
-        # This is now just a backup handler - state change should handle it
-        logger.debug("_on_processing_paused called - delegating to state handler")
+        """Handle processing paused signal - backup handler only."""
+        logger.debug("_on_processing_paused called - verifying state consistency")
         if hasattr(self, 'orchestrator') and hasattr(self.orchestrator, 'state'):
-            # Just double-check that we're actually in PAUSED state
+            # Just verify state consistency - all UI updates handled by state change handler
             if self.orchestrator.state != ProcessingState.PAUSED:
-                logger.warning(f"Expected PAUSED state but got {self.orchestrator.state}, fixing...")
-                # Force state to PAUSED
-                self.orchestrator.state = ProcessingState.PAUSED
+                logger.warning(f"Expected PAUSED state but got {self.orchestrator.state}, triggering state handler")
                 self._on_processing_state_changed(ProcessingState.PAUSED)
         else:
             logger.warning("Orchestrator not available for state check")
     
     def _on_processing_stopped(self):
-        """Handle processing stopped signal."""
-        # This is now just a backup handler - state change should handle it
-        logger.debug("_on_processing_stopped called - delegating to state handler")
+        """Handle processing stopped signal - backup handler only."""
+        logger.debug("_on_processing_stopped called - verifying state consistency")
         if hasattr(self, 'orchestrator') and hasattr(self.orchestrator, 'state'):
-            # Just double-check that we're actually in STOPPED state
+            # Just verify state consistency - all UI updates handled by state change handler
             if self.orchestrator.state != ProcessingState.STOPPED:
-                logger.warning(f"Expected STOPPED state but got {self.orchestrator.state}, fixing...")
-                # Force state to STOPPED
-                self.orchestrator.state = ProcessingState.STOPPED
+                logger.warning(f"Expected STOPPED state but got {self.orchestrator.state}, triggering state handler")
                 self._on_processing_state_changed(ProcessingState.STOPPED)
         else:
             logger.warning("Orchestrator not available for state check")
-        
-        logger.info("UI updated: processing stopped")
     
     def _on_processing_completed(self):
         """Handle processing completed signal."""
         # Stop activity animation
         self._activity_timer.stop()
         
-        self.proc_status_label.setText("⚙️ COMPLETED")
-        self.proc_status_label.setStyleSheet("""
-            QLabel {
-                color: #4CAF50;
-                font-size: 18pt;
-                font-weight: bold;
-                background: transparent;
-            }
-        """)
+        self._set_processing_status("⚙️ COMPLETED", "success")
         self.processing_status_bar_label.setText("Complete")
         
         # Show final speed statistics
@@ -1924,19 +2872,10 @@ class MainWindow(QMainWindow):
         # Update progress bar for this file
         if file_path in self._file_progress_bars:
             progress_bar = self._file_progress_bars[file_path]
-            progress_bar.setValue(10)  # Show some initial progress
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(10)
             progress_bar.setFormat("Starting...")
-            progress_bar.setStyleSheet("""
-                QProgressBar {
-                    border: 1px solid #3498db;
-                    border-radius: 3px;
-                    text-align: center;
-                    background-color: #ecf0f1;
-                }
-                QProgressBar::chunk {
-                    background-color: #3498db;
-                }
-            """)
+            self._set_progress_bar_style(progress_bar)
         
         # Get the current orchestrator state - don't update status if we're pausing/stopping
         if hasattr(self, 'orchestrator') and hasattr(self.orchestrator, 'state'):
@@ -1969,18 +2908,8 @@ class MainWindow(QMainWindow):
         if result.file_path in self._file_progress_bars:
             progress_bar = self._file_progress_bars[result.file_path]
             progress_bar.setValue(100)
-            progress_bar.setFormat("✓ Done")
-            progress_bar.setStyleSheet("""
-                QProgressBar {
-                    border: 1px solid #27ae60;
-                    border-radius: 3px;
-                    text-align: center;
-                    background-color: #ecf0f1;
-                }
-                QProgressBar::chunk {
-                    background-color: #27ae60;
-                }
-            """)
+            progress_bar.setFormat("✓ Completed")
+            self._set_progress_bar_style(progress_bar, text_color=self.QUEUE_PALETTE['text_primary'])
         
         # Clear current file if this was it
         if self._current_processing_file == result.file_path:
@@ -2004,7 +2933,7 @@ class MainWindow(QMainWindow):
                         if cell_item:
                             from PySide6.QtGui import QColor
                             # Set a light green background for the new item
-                            cell_item.setBackground(QColor(240, 255, 240))
+                            cell_item.setBackground(QColor(self.APP_PALETTE['selected_hover']))
                     break
         except Exception as e:
             logger.error(f"Failed to auto-update results: {e}")
@@ -2039,17 +2968,12 @@ class MainWindow(QMainWindow):
             progress_bar = self._file_progress_bars[file_path]
             progress_bar.setValue(100)
             progress_bar.setFormat("✗ Failed")
-            progress_bar.setStyleSheet("""
-                QProgressBar {
-                    border: 1px solid #e74c3c;
-                    border-radius: 3px;
-                    text-align: center;
-                    background-color: #ecf0f1;
-                }
-                QProgressBar::chunk {
-                    background-color: #e74c3c;
-                }
-            """)
+            self._set_progress_bar_style(
+                progress_bar,
+                chunk_color=self.APP_PALETTE['alert_error'],
+                border_color=self.APP_PALETTE['alert_error'],
+                text_color=self.APP_PALETTE['text_primary']
+            )
         
         # Clear current file if this was it
         if self._current_processing_file == file_path:
@@ -2190,16 +3114,11 @@ class MainWindow(QMainWindow):
         """Handle processing state changed signal."""
         logger.info(f"Processing state changed to {state}")
         
+        # Sync new controls state first
+        self._sync_new_controls_state()
+        
         if state == ProcessingState.IDLE:
-            self.proc_status_label.setText("⚙️ IDLE")
-            self.proc_status_label.setStyleSheet("""
-                QLabel {
-                    color: white;
-                    font-size: 18pt;
-                    font-weight: bold;
-                    background: transparent;
-                }
-            """)
+            self._set_processing_status("⚙️ IDLE")
             self.processing_status_bar_label.setText("Idle")
             self._reset_processing_ui()
             
@@ -2213,31 +3132,32 @@ class MainWindow(QMainWindow):
             if not self._activity_timer.isActive():
                 self._activity_timer.start(80)
             
-            # Update status with yellow color
-            self.proc_status_label.setStyleSheet("""
-                QLabel {
-                    color: #FF9800;
-                    font-size: 18pt;
-                    font-weight: bold;
-                    background: transparent;
-                }
-            """)
+            self._set_processing_status("⠋ PAUSING...", "warning")
             self.processing_status_bar_label.setText("Pausing...")
         elif state == ProcessingState.PAUSED:
             # Stop activity animation
-            self._activity_timer.stop()
+            if hasattr(self, '_activity_timer') and self._activity_timer.isActive():
+                self._activity_timer.stop()
+            
+            # Stop progress bar pulse animation
+            if hasattr(self, '_progress_pulse_timer') and self._progress_pulse_timer.isActive():
+                self._progress_pulse_timer.stop()
             
             # Set status text directly (don't rely on spinner animation)
-            self.proc_status_label.setText("⚙️ PAUSED")
-            self.proc_status_label.setStyleSheet("""
-                QLabel {
-                    color: #FF9800;
-                    font-size: 18pt;
-                    font-weight: bold;
-                    background: transparent;
-                }
-            """)
+            self._set_processing_status("⚙️ PAUSED", "warning")
             self.processing_status_bar_label.setText("Paused")
+            
+            # Update the progress bar format to show paused
+            completed = self.proc_progress.value()
+            maximum = self.proc_progress.maximum()
+            percentage = int(completed / max(1, maximum) * 100)
+            self.proc_progress.setFormat(f"%v / %m files ({percentage}%) • Paused")
+            
+            # Refresh the queue table to show current status of all items
+            self._refresh_queue_table()
+            
+            # Reset the stage info to show paused
+            self.proc_stage_label.setText("🔍 Stage: Paused")
             
             # Save the time when processing was paused and record elapsed time
             from datetime import datetime
@@ -2245,58 +3165,55 @@ class MainWindow(QMainWindow):
             if self._processing_start_time:
                 self._paused_elapsed_seconds = (self._pause_time - self._processing_start_time).total_seconds()
             
-            # Update buttons
-            self.proc_start_btn.setEnabled(True)
-            self.proc_start_btn.setText("▶ Resume")
-            self.proc_pause_btn.setEnabled(False)
-            self.proc_stop_btn.setEnabled(True)
-            self.proc_retry_btn.setEnabled(False)  # Disable retry during paused state
+            # Update buttons safely
+            self._update_control_buttons_safe(start_enabled=True, pause_enabled=True)
+            # Update button text for old controls only
+            if not self._using_new_controls:
+                if hasattr(self, 'proc_start_btn') and self.proc_start_btn:
+                    self.proc_start_btn.setText("▶ Resume")
+                if hasattr(self, 'proc_pause_btn') and self.proc_pause_btn:
+                    self.proc_pause_btn.setText("▶ Resume")
+            self._style_button(self.proc_pause_btn, variant="success")
+            # Also update the other pause button if it exists
+            if hasattr(self, 'pause_btn'):
+                self.pause_btn.setEnabled(True)
+                self.pause_btn.setText("▶ Resume")
+                self._style_button(self.pause_btn, variant="success")
+            self._update_control_buttons_safe(stop_enabled=True, retry_enabled=False)  # Disable retry during paused state
         elif state == ProcessingState.STOPPING:
             # Start spinner animation for STOPPING state
             if not self._activity_timer.isActive():
                 self._activity_timer.start(80)
             
-            # Update status with red color
-            self.proc_status_label.setStyleSheet("""
-                QLabel {
-                    color: #F44336;
-                    font-size: 18pt;
-                    font-weight: bold;
-                    background: transparent;
-                }
-            """)
+            self._set_processing_status("⠋ STOPPING...", "error")
             self.processing_status_bar_label.setText("Stopping...")
             
-            # Update buttons
-            self.proc_start_btn.setEnabled(False)
-            self.proc_pause_btn.setEnabled(False)
-            self.proc_stop_btn.setEnabled(False)
-            self.proc_retry_btn.setEnabled(False)  # Disable retry during stopping
+            # Update buttons safely
+            self._update_control_buttons_safe(
+                start_enabled=False,
+                pause_enabled=False,
+                stop_enabled=False,
+                retry_enabled=False  # Disable retry during stopping
+            )
         elif state == ProcessingState.STOPPED:
             # Stop activity animation
             self._activity_timer.stop()
             
             # Set status text directly (don't rely on spinner animation)
-            self.proc_status_label.setText("⚙️ STOPPED")
-            self.proc_status_label.setStyleSheet("""
-                QLabel {
-                    color: #F44336;
-                    font-size: 18pt;
-                    font-weight: bold;
-                    background: transparent;
-                }
-            """)
+            self._set_processing_status("⚙️ STOPPED", "error")
             self.processing_status_bar_label.setText("Stopped")
             
-            # Update buttons
-            self.proc_start_btn.setEnabled(True)
-            self.proc_start_btn.setText("▶ Start")
-            self.proc_pause_btn.setEnabled(False)
-            self.proc_stop_btn.setEnabled(False)
-            
-            # Enable retry button if there are failed items
-            if self.orchestrator and self.orchestrator.failed_count > 0:
-                self.proc_retry_btn.setEnabled(True)
+            # Update buttons safely
+            retry_enabled = (self.orchestrator and self.orchestrator.failed_count > 0)
+            self._update_control_buttons_safe(
+                start_enabled=True,
+                pause_enabled=False,
+                stop_enabled=False,
+                retry_enabled=retry_enabled
+            )
+            # Update button text for old controls only
+            if not self._using_new_controls and hasattr(self, 'proc_start_btn') and self.proc_start_btn:
+                self.proc_start_btn.setText("▶ Start")
             else:
                 self.proc_retry_btn.setEnabled(False)
         elif state == ProcessingState.RUNNING:
@@ -2307,6 +3224,8 @@ class MainWindow(QMainWindow):
             # Start progress bar pulse animation
             if not self._progress_pulse_timer.isActive():
                 self._progress_pulse_timer.start()
+
+            self._set_processing_status("⚙️ RUNNING", "info")
                 
             # Make sure elapsed timer is started and handle resuming
             from datetime import datetime, timedelta
@@ -2332,28 +3251,73 @@ class MainWindow(QMainWindow):
                 self._elapsed_timer.timeout.connect(self._update_elapsed_time)
                 self._elapsed_timer.start()
                 logger.debug("Started elapsed time timer")
-            
-            # Update status with green color
-            self.proc_status_label.setStyleSheet("""
-                QLabel {
-                    color: #4CAF50;
-                    font-size: 18pt;
-                    font-weight: bold;
-                    background: transparent;
-                }
-            """)
             self.processing_status_bar_label.setText("Processing...")
             
-            # Update buttons - enable pause during processing
-            self.proc_start_btn.setEnabled(False)
-            self.proc_pause_btn.setEnabled(True)  # Enable pause button in RUNNING state
-            self.proc_stop_btn.setEnabled(True)
-            self.proc_retry_btn.setEnabled(False)  # Disable retry during processing
+            # Update buttons safely - enable pause during processing
+            self._update_control_buttons_safe(start_enabled=False, pause_enabled=True)
+            # Update button text and style for old controls only
+            if not self._using_new_controls:
+                if hasattr(self, 'proc_pause_btn') and self.proc_pause_btn:
+                    self.proc_pause_btn.setText("⏸ Pause")
+                    self._style_button(self.proc_pause_btn, variant="warning")
+            # Also update the other pause button if it exists
+            if hasattr(self, 'pause_btn'):
+                self.pause_btn.setEnabled(True)
+                self.pause_btn.setText("⏸ Pause")
+                self._style_button(self.pause_btn, variant="warning")
+            self._update_control_buttons_safe(stop_enabled=True, retry_enabled=False)  # Disable retry during processing
+            
+            # Refresh the queue table to show updated status (especially when resuming)
+            self._refresh_queue_table()
+    
+    def _sync_new_controls_state(self):
+        """Sync the new processing controls with current application state."""
+        if not self.processing_controls_integration:
+            return
+            
+        try:
+            # Throttle updates to avoid excessive calls
+            import time
+            current_time = time.time()
+            if current_time - self._last_progress_update < 0.1:  # 100ms throttle
+                return
+            self._last_progress_update = current_time
+            
+            # Update retry button visibility based on failed items
+            failed_count = 0
+            if self.orchestrator and hasattr(self.orchestrator, 'failed_count'):
+                failed_count = self.orchestrator.failed_count
+            elif hasattr(self, 'queue_manager') and self.queue_manager:
+                # Fallback to checking queue manager for failed items
+                stats = self.queue_manager.get_statistics()
+                failed_count = stats.get('failed', 0)
+                
+            self.processing_controls_integration.show_retry_button(failed_count > 0)
+            
+            # Update progress information
+            if self.orchestrator:
+                current = getattr(self.orchestrator, 'processed_count', 0)
+                total_pending = 0
+                if hasattr(self, 'queue_manager') and self.queue_manager:
+                    stats = self.queue_manager.get_statistics()
+                    total_pending = stats.get('pending', 0) + stats.get('processing', 0)
+                
+                total = current + total_pending + failed_count
+                if total > 0:  # Only update if we have meaningful data
+                    self.processing_controls_integration.update_progress(current, total, failed_count)
+            
+            # Enable confirmation dialogs (can be made configurable later)
+            self.processing_controls_integration.enable_confirmation_dialogs(True)
+            
+        except Exception as e:
+            logger.warning(f"Failed to sync new controls state: {e}")
     
     def _reset_processing_ui(self):
         """Reset processing UI to initial state."""
-        self.proc_start_btn.setEnabled(True)
-        self.proc_start_btn.setText("▶ Start")
+        self._update_control_buttons_safe(start_enabled=True)
+        # Update button text for old controls only
+        if not self._using_new_controls and hasattr(self, 'proc_start_btn') and self.proc_start_btn:
+            self.proc_start_btn.setText("▶ Start")
         
         # Reset pause tracking
         self._pause_time = None
@@ -2464,8 +3428,13 @@ class MainWindow(QMainWindow):
             logger.error(f"Failed to export results: {e}")
             self._show_notification(f"Export failed: {str(e)}", "error")
             
-    def _export_to_csv(self, filepath):
-        """Export results to CSV format."""
+    def _export_to_csv(self, filepath, file_ids=None):
+        """Export results to CSV format.
+        
+        Args:
+            filepath: Path to save the CSV file
+            file_ids: Optional list of file IDs to export. If None, exports all files.
+        """
         import csv
         
         with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
@@ -2478,9 +3447,10 @@ class MainWindow(QMainWindow):
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Join tables to get complete data
-                cursor.execute("""
+                # Base SQL query
+                sql_query = """
                     SELECT 
+                        f.file_id,
                         f.file_path,
                         GROUP_CONCAT(c.tag_text, '; ') as tags,
                         d.description_text,
@@ -2489,9 +3459,24 @@ class MainWindow(QMainWindow):
                     LEFT JOIN classifications c ON f.file_id = c.file_id
                     LEFT JOIN descriptions d ON f.file_id = d.file_id
                     WHERE f.processed_date IS NOT NULL
+                """
+                
+                # Add file_id filter if specific IDs are provided
+                params = ()
+                if file_ids:
+                    # Use parameter placeholders based on number of IDs
+                    placeholders = ','.join('?' * len(file_ids))
+                    sql_query += f" AND f.file_id IN ({placeholders})"
+                    params = tuple(file_ids)
+                
+                # Complete the query
+                sql_query += """
                     GROUP BY f.file_id
                     ORDER BY f.processed_date DESC
-                """)
+                """
+                
+                # Execute the query with or without file_id parameters
+                cursor.execute(sql_query, params)
                 
                 rows = cursor.fetchall()
                 for row in rows:
@@ -2508,8 +3493,13 @@ class MainWindow(QMainWindow):
         
         logger.info(f"Exported {len(rows)} records to CSV: {filepath}")
             
-    def _export_to_json(self, filepath):
-        """Export results to JSON format."""
+    def _export_to_json(self, filepath, file_ids=None):
+        """Export results to JSON format.
+        
+        Args:
+            filepath: Path to save the JSON file
+            file_ids: Optional list of file IDs to export. If None, exports all files.
+        """
         import json
         
         results = []
@@ -2518,13 +3508,26 @@ class MainWindow(QMainWindow):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Get all processed files
-            cursor.execute("""
+            # Base SQL query
+            sql_query = """
                 SELECT file_id, file_path, file_hash, processed_date
                 FROM files
                 WHERE processed_date IS NOT NULL
-                ORDER BY processed_date DESC
-            """)
+            """
+            
+            # Add file_id filter if specific IDs are provided
+            params = ()
+            if file_ids:
+                # Use parameter placeholders based on number of IDs
+                placeholders = ','.join('?' * len(file_ids))
+                sql_query += f" AND file_id IN ({placeholders})"
+                params = tuple(file_ids)
+            
+            # Complete the query
+            sql_query += " ORDER BY processed_date DESC"
+            
+            # Execute the query with or without file_id parameters
+            cursor.execute(sql_query, params)
             
             files = cursor.fetchall()
             
@@ -2577,6 +3580,56 @@ class MainWindow(QMainWindow):
             json.dump(results, f, indent=2, ensure_ascii=False)
             
         logger.info(f"Exported {len(results)} records to JSON: {filepath}")
+    
+    def _delete_selected_result(self):
+        """Delete the currently selected result from the database."""
+        from PySide6.QtWidgets import QMessageBox
+        
+        # Get the current selection
+        current_row = self.results_table.currentRow()
+        
+        if current_row < 0:
+            self._show_notification("Please select a result to delete", "warning", 3000)
+            return
+        
+        # Get file_id and filename from the selected row
+        file_id = self.results_table.item(current_row, 0).data(Qt.ItemDataRole.UserRole)
+        filename = self.results_table.item(current_row, 2).text()
+        
+        if not file_id:
+            logger.error("No file_id found in selected row")
+            return
+        
+        # Confirm deletion with the user
+        confirm = QMessageBox.question(
+            self,
+            "Delete Result",
+            f"Are you sure you want to delete the result for '{filename}'?\n\n"
+            "This will remove all analysis data for this file from the database. "
+            "The original file will not be affected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            # Delete the record from database
+            success = self.db.delete_file_record(file_id)
+            
+            if success:
+                # Remove from the table
+                self.results_table.removeRow(current_row)
+                self._update_results_count_label()
+                self._show_notification("Result deleted successfully", "success")
+                logger.info(f"Deleted result for file: {filename} (ID: {file_id})")
+            else:
+                self._show_notification("Failed to delete result", "error", 3000)
+                
+        except Exception as e:
+            logger.error(f"Error deleting result: {e}")
+            self._show_notification(f"Error: {e}", "error", 5000)
             
     def _show_ai_models(self):
         """Show AI model management dialog."""
@@ -2593,26 +3646,31 @@ class MainWindow(QMainWindow):
         # Create a subtle ripple effect in the progress bar
         self._progress_pulse_effect = (self._progress_pulse_effect + 1) % 4
         
-        # Change the gradient colors slightly based on the pulse effect
+        colors = self.APP_PALETTE
+        accent = colors['accent']
+        focus = colors['focus']
+        selected = colors['selected']
+        selected_hover = colors['selected_hover']
+
         if self._progress_pulse_effect == 0:
-            chunk_style = """
+            chunk_style = f"""
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4CAF50, stop:0.5 #66BB6A, stop:1 #81C784);
+                    stop:0 {accent}, stop:0.5 {focus}, stop:1 {selected});
             """
         elif self._progress_pulse_effect == 1:
-            chunk_style = """
+            chunk_style = f"""
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #66BB6A, stop:0.5 #81C784, stop:1 #4CAF50);
+                    stop:0 {focus}, stop:0.5 {selected}, stop:1 {selected_hover});
             """
         elif self._progress_pulse_effect == 2:
-            chunk_style = """
+            chunk_style = f"""
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #81C784, stop:0.5 #4CAF50, stop:1 #66BB6A);
+                    stop:0 {selected}, stop:0.5 {selected_hover}, stop:1 {accent});
             """
         else:
-            chunk_style = """
+            chunk_style = f"""
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4CAF50, stop:0.3 #81C784, stop:0.7 #66BB6A, stop:1 #4CAF50);
+                    stop:0 {accent}, stop:0.3 {selected_hover}, stop:0.7 {focus}, stop:1 {accent});
             """
         
         # Update progress bar style with the new gradient
@@ -2693,7 +3751,7 @@ class MainWindow(QMainWindow):
                 self.results_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, file_data['file_id'])
             
             # Update count
-            self.results_count_label.setText(f"Total files: {len(files)}")
+            self.results_count_label.setText(str(len(files)))
             
             logger.info(f"Results table refreshed: {len(files)} files")
             
@@ -2762,7 +3820,7 @@ class MainWindow(QMainWindow):
                 self.results_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, file_id)
             
             # Update count
-            self.results_count_label.setText(f"Search results: {len(file_results)}")
+            self.results_count_label.setText(str(len(file_results)))
             
             self._show_notification(f"Found {len(file_results)} matching files", "success", 3000)
             
@@ -2786,15 +3844,21 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("Clear All Results")
         dialog.setModal(True)
         dialog.setMinimumWidth(450)
-        
-        # Set dialog stylesheet
-        dialog.setStyleSheet("""
-            QDialog {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #2c3e50, stop:1 #34495e);
-                border-radius: 8px;
-            }
-        """)
+
+        colors = self.APP_PALETTE
+        dialog.setStyleSheet(
+            f"""
+            QDialog {{
+                background-color: {colors['surface']};
+                color: {colors['text_primary']};
+                border: 1px solid {colors['dividers']};
+                border-radius: 10px;
+            }}
+            QLabel {{
+                color: {colors['text_secondary']};
+            }}
+            """
+        )
         
         layout = QVBoxLayout(dialog)
         layout.setSpacing(20)
@@ -2817,7 +3881,9 @@ class MainWindow(QMainWindow):
         title_font.setPointSize(16)
         title_font.setBold(True)
         title_label.setFont(title_font)
-        title_label.setStyleSheet("color: white; background: transparent; padding-left: 10px;")
+        title_label.setStyleSheet(
+            f"color: {colors['text_primary']}; background: transparent; padding-left: 10px;"
+        )
         title_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         title_row.addWidget(title_label, 1)
         
@@ -2831,15 +3897,17 @@ class MainWindow(QMainWindow):
             "• This action cannot be undone"
         )
         message.setWordWrap(True)
-        message.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.9);
+        message.setStyleSheet(
+            f"""
+            QLabel {{
+                color: {colors['text_secondary']};
                 font-size: 11pt;
                 background: transparent;
                 padding: 10px;
                 line-height: 1.5;
-            }
-        """)
+            }}
+            """
+        )
         layout.addWidget(message)
         
         # Get count for display
@@ -2854,18 +3922,20 @@ class MainWindow(QMainWindow):
         
         if count > 0:
             count_label = QLabel(f"📊 {count} file{'s' if count != 1 else ''} will be deleted")
-            count_label.setStyleSheet("""
-                QLabel {
-                    color: #e74c3c;
+            count_color = colors['alert_error']
+            count_label.setStyleSheet(
+                f"""
+                QLabel {{
+                    color: {count_color};
                     font-size: 12pt;
-                    font-weight: bold;
-                   
-                    background: rgba(231, 76, 60, 0.1);
+                    font-weight: 600;
+                    background-color: {colors['surface_alt']};
                     padding: 12px;
-                    border-radius: 6px;
-                    border: 2px solid #e74c3c;
-                }
-            """)
+                    border-radius: 8px;
+                    border: 1px solid {count_color};
+                }}
+                """
+            )
             count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(count_label)
         
@@ -2877,24 +3947,7 @@ class MainWindow(QMainWindow):
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setMinimumHeight(40)
         cancel_btn.setMinimumWidth(120)
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #7f8c8d;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 10px 20px;
-                font-size: 11pt;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #95a5a6;
-            }
-            QPushButton:pressed {
-                background-color: #6c7a7b;
-            }
-        """)
+        self._style_button(cancel_btn, variant="secondary")
         cancel_btn.clicked.connect(dialog.reject)
         button_layout.addWidget(cancel_btn)
         
@@ -2904,24 +3957,7 @@ class MainWindow(QMainWindow):
         delete_btn = QPushButton("🗑️ Delete All")
         delete_btn.setMinimumHeight(40)
         delete_btn.setMinimumWidth(140)
-        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        delete_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 10px 20px;
-                font-size: 11pt;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #c0392b;
-            }
-            QPushButton:pressed {
-                background-color: #a93226;
-            }
-        """)
+        self._style_button(delete_btn, variant="danger")
         delete_btn.clicked.connect(dialog.accept)
         delete_btn.setDefault(False)  # Don't make it default (safer)
         button_layout.addWidget(delete_btn)
@@ -2982,6 +4018,111 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error viewing result details: {e}")
             self._show_notification(f"Error loading details: {e}", "error", 5000)
+
+    def _open_result_file(self) -> None:
+        """Open the currently selected result file with the default application."""
+        current_row = self.results_table.currentRow()
+
+        if current_row < 0:
+            self._show_notification("Please select a file to open", "warning", 3000)
+            return
+
+        file_item = self.results_table.item(current_row, 0)
+        if file_item is None:
+            self._show_notification("Unable to determine selected file", "error", 3000)
+            return
+
+        file_id = file_item.data(Qt.ItemDataRole.UserRole)
+        if not file_id:
+            logger.error("Selected row is missing file_id metadata")
+            self._show_notification("Unable to locate file in database", "error", 3000)
+            return
+
+        try:
+            file_details = self.db.get_file_details(file_id)
+            if not file_details:
+                self._show_notification("File details not found", "error", 3000)
+                return
+
+            file_path = Path(file_details.get("file_path", ""))
+            if not file_path:
+                self._show_notification("File path unavailable", "error", 3000)
+                return
+
+            if not file_path.exists():
+                self._show_notification("File not found on disk", "warning", 4000)
+                logger.warning(f"Result file missing on disk: {file_path}")
+                return
+
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path)))
+            if not opened:
+                self._show_notification("Unable to open file", "error", 4000)
+                logger.error(f"QDesktopServices failed to open file: {file_path}")
+            else:
+                logger.info(f"Opened result file: {file_path}")
+
+        except Exception as e:
+            logger.error(f"Error opening result file: {e}")
+            self._show_notification(f"Error opening file: {e}", "error", 5000)
+    
+    def _export_selected_results(self):
+        """Export currently selected results to CSV or JSON file."""
+        # Check if any rows are selected
+        selected_rows = set()
+        for index in self.results_table.selectedIndexes():
+            selected_rows.add(index.row())
+            
+        if not selected_rows:
+            self._show_notification("No results selected. Please select at least one result to export.", "warning", 3000)
+            return
+        
+        # Get the file IDs from selected rows
+        selected_file_ids = []
+        for row in selected_rows:
+            file_id_item = self.results_table.item(row, 0)
+            if file_id_item:
+                file_id = file_id_item.data(Qt.ItemDataRole.UserRole)
+                if file_id:
+                    selected_file_ids.append(file_id)
+        
+        if not selected_file_ids:
+            self._show_notification("Could not retrieve selected file IDs", "error", 3000)
+            return
+            
+        from PySide6.QtWidgets import QFileDialog
+        
+        # Let user choose file format and location
+        file_filter = "CSV Files (*.csv);;JSON Files (*.json)"
+        export_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Selected Results",
+            "",
+            file_filter
+        )
+        
+        if not export_path:
+            return  # User cancelled
+        
+        try:
+            # Determine export format from file extension or filter
+            if export_path.lower().endswith('.csv'):
+                self._export_to_csv(export_path, selected_file_ids)
+            elif export_path.lower().endswith('.json'):
+                self._export_to_json(export_path, selected_file_ids)
+            else:
+                # Add default extension based on filter
+                if "CSV" in selected_filter:
+                    export_path += ".csv"
+                    self._export_to_csv(export_path, selected_file_ids)
+                else:
+                    export_path += ".json"
+                    self._export_to_json(export_path, selected_file_ids)
+            
+            self._show_notification(f"Selected results exported to {export_path}", "info")
+            
+        except Exception as e:
+            logger.error(f"Failed to export selected results: {e}")
+            self._show_notification(f"Export failed: {e}", "error", 5000)
     
     def _show_file_details_dialog(self, file_details: dict):
         """

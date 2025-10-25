@@ -433,6 +433,40 @@ class Database:
             
             return stats
     
+    def delete_file_record(self, file_id: int) -> bool:
+        """
+        Delete a specific file record and its associated data from the database.
+        
+        Related records in pages, classifications, and descriptions tables 
+        are automatically deleted via CASCADE DELETE constraints.
+        
+        Args:
+            file_id: The ID of the file to delete
+            
+        Returns:
+            True if successful, False if file_id was not found or deletion failed
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Verify the file exists
+                cursor.execute("SELECT file_id FROM files WHERE file_id = ?", (file_id,))
+                result = cursor.fetchone()
+                if not result:
+                    logger.warning(f"Attempted to delete non-existent file_id: {file_id}")
+                    return False
+                
+                # Delete the file record (cascade will handle related tables)
+                cursor.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
+                
+                logger.info(f"Deleted file record with ID: {file_id}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error deleting file record: {e}")
+            return False
+    
     def clear_all_results(self) -> int:
         """
         Clear all analyzed results from the database.

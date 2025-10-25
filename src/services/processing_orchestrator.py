@@ -168,35 +168,99 @@ class ProcessingOrchestrator(QObject):
             logger.warning(f"Processing not running (state={self.state}), cannot pause")
             return
 
-        # Immediately pause and reset current item to pending
+        # Immediately pause - set the flag first so any active processing can detect it
         self.should_pause = True
-        self.state = ProcessingState.PAUSED
-
-        # If there's a current item being processed, reset it to pending so it can be restarted
+        # Change state to PAUSING to give user feedback
+        self.state = ProcessingState.PAUSING
+        self.state_changed.emit(self.state)
+        
+        # First reset ANY items that might be in processing state
+        self._reset_in_progress_items()
+        
+        # Then specifically handle the current item if it exists
         if self.current_item:
-            logger.info(f"Resetting current item {self.current_item.file_path} to pending for later resume")
-            self.queue.update_item_status(self.current_item.file_path, QueueItemStatus.PENDING)
-            self.current_item = None
-
+            try:
+                logger.info(f"Resetting current item {self.current_item.file_path} to pending for later resume")
+                self.queue.update_item_status(self.current_item.file_path, QueueItemStatus.PENDING, 0)
+                
+                # Also emit a signal to update the UI progress for this item
+                self.item_progress_updated.emit(self.current_item.file_path, 0, "Pending")
+                
+                self.current_item = None
+            except Exception as e:
+                logger.error(f"Error resetting current item: {str(e)}")
+        
+        # If we're in the middle of database operations, allow current DB transaction to complete
+        # but signal to the processing loop that it should not proceed to the next item
+        # This prevents database corruption while still allowing pause
+        
+        # Now set to fully paused state
+        self.state = ProcessingState.PAUSED
         logger.info("Processing immediately paused, current item reset to pending")
         self.processing_paused.emit()
-        self.state_changed.emit(self.state)
+        self.state_changed.emit(self.state)  # Emit state changed for UI update
+        
+        # Force a refresh of the progress statistics
+        stats = self.queue.get_statistics()
+        self.progress_updated.emit(
+            self.processed_count + self.failed_count + self.skipped_count,
+            stats['total'],
+            ""  # No current file
+        )
     
     @Slot()
     def resume_processing(self):
         """Resume processing from paused state, restarting from the beginning of the queue."""
         if self.state != ProcessingState.PAUSED:
-            logger.warning("Processing not paused, cannot resume")
+            logger.warning(f"Processing not paused (state={self.state}), cannot resume")
             return
 
+        # Reset any in-progress items first
+        self._reset_in_progress_items()
+        
+        # Make sure we're actually moving from PAUSED to RUNNING
         self.state = ProcessingState.RUNNING
         self.should_pause = False
 
         logger.info("Processing resumed from paused state")
         self.state_changed.emit(self.state)
-
+        
+        # Emit a signal to update progress UI
+        stats = self.queue.get_statistics()
+        self.progress_updated.emit(
+            self.processed_count + self.failed_count + self.skipped_count,
+            stats['total'],
+            ""  # No current file
+        )
+        
         # Start processing from the beginning of the queue (including any previously paused items)
         self._process_next_item()
+        
+    def _reset_in_progress_items(self):
+        """Reset any items still marked as 'processing' to 'pending'."""
+        items = self.queue.get_queue_items()
+        reset_count = 0
+        
+        for item in items:
+            if item.status == QueueItemStatus.PROCESSING:
+                logger.info(f"Found item still marked as processing: {item.file_path}, resetting to pending")
+                self.queue.update_item_status(item.file_path, QueueItemStatus.PENDING, 0)  # Reset progress to 0
+                reset_count += 1
+                
+                # Also emit a signal to update the UI progress for this item
+                self.item_progress_updated.emit(item.file_path, 0, "Pending")
+                
+        if reset_count > 0:
+            logger.info(f"Reset {reset_count} items from processing to pending")
+            # Notify UI that items were changed
+            self.queue.items_updated.emit()
+            # Update queue statistics
+            stats = self.queue.get_statistics()
+            self.progress_updated.emit(
+                self.processed_count + self.failed_count + self.skipped_count,
+                stats['total'],
+                ""  # No current file
+            )
     
     @Slot()
     def stop_processing(self):
@@ -506,7 +570,8 @@ class ProcessingOrchestrator(QObject):
         """Process the next item in the queue."""
         logger.info("_process_next_item called")
         
-        # Check for stop/pause requests
+        # CRITICAL CHECK for pause/stop flags BEFORE processing any item
+        # First check direct stop/pause flags
         if self.should_stop:
             logger.info("Stop requested, handling stop...")
             self._handle_stop()
@@ -515,6 +580,15 @@ class ProcessingOrchestrator(QObject):
         if self.should_pause:
             logger.info("Pause requested, handling pause...")
             self._handle_pause()
+            return
+            
+        # Also check state to be extra sure (might have been set directly)
+        if self.state == ProcessingState.STOPPED or self.state == ProcessingState.PAUSED or self.state == ProcessingState.PAUSING:
+            logger.info(f"Not processing next item due to state: {self.state}")
+            if self.state == ProcessingState.STOPPED:
+                self._handle_stop()
+            else:
+                self._handle_pause()
             return
         
         # Get next item
@@ -660,20 +734,21 @@ class ProcessingOrchestrator(QObject):
                 # Emit progress: Starting vision analysis
                 self.item_progress_updated.emit(file_path, 20, "Starting vision analysis...")
                 
-                # Check for pause/stop BEFORE starting vision processing
-                if self.should_stop:
-                    logger.info("Stop requested before vision processing, handling stop...")
+                # CRITICAL CHECK for pause/stop BEFORE starting vision processing
+                # This is a key moment where we should immediately respect pause/stop requests
+                if self.should_stop or self.state == ProcessingState.STOPPED:
+                    logger.info(f"Stop requested before vision processing, handling stop... State: {self.state}")
                     self.queue.update_item_status(file_path, QueueItemStatus.PENDING)
                     self._handle_stop()
                     return
                 
-                if self.should_pause:
-                    logger.info("Pause requested before vision processing, handling pause...")
+                if self.should_pause or self.state == ProcessingState.PAUSED or self.state == ProcessingState.PAUSING:
+                    logger.info(f"Pause requested before vision processing, handling pause... State: {self.state}")
                     self.queue.update_item_status(file_path, QueueItemStatus.PENDING)
                     self._handle_pause()
                     return
                 
-                logger.info(f"Starting vision analysis, should_pause={self.should_pause}, should_stop={self.should_stop}")
+                logger.info(f"Starting vision analysis, should_pause={self.should_pause}, should_stop={self.should_stop}, state={self.state}")
                 
                 # Create empty OCR results (vision will analyze the image directly)
                 ocr_results = []
@@ -681,6 +756,13 @@ class ProcessingOrchestrator(QObject):
                 
                 # Use vision to analyze the image file directly
                 try:
+                    # Final check right before the potentially long-running operation
+                    if self.should_pause or self.state == ProcessingState.PAUSED or self.state == ProcessingState.PAUSING:
+                        logger.info(f"Last-minute pause detected before vision analysis, handling pause... State: {self.state}")
+                        self.queue.update_item_status(file_path, QueueItemStatus.PENDING)
+                        self._handle_pause()
+                        return
+                        
                     vision_results = self.llm.analyze_image_vision(file_path)
                     
                     # Emit progress: Vision analysis complete
